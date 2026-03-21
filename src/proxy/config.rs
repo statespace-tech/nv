@@ -356,6 +356,11 @@ pub(crate) fn port_path(project_dir: &Path) -> PathBuf {
     runtime_dir(project_dir).join("proxy.port")
 }
 
+/// Path to the agent-readable session list (hostnames + auth timestamps).
+pub(crate) fn sessions_path(project_dir: &Path) -> PathBuf {
+    runtime_dir(project_dir).join("sessions")
+}
+
 pub(crate) fn validate_project_dir(project_dir: &Path) -> Result<()> {
     if !config_path(project_dir).exists() {
         return Err(Error::cli(format!(
