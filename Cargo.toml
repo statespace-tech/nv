@@ -1,0 +1,63 @@
+[package]
+name = "nv"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["Statespace Authors"]
+license = "MIT"
+repository = "https://github.com/statespace-tech/nv"
+description = "Net environment CLI — a transparent browser for agents"
+
+[[bin]]
+name = "nv"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+dirs = "5"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+rcgen = { version = "0.14", features = ["x509-parser"] }
+rustls = { version = "0.23", features = ["ring"] }
+tokio-rustls = "0.26"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+indexmap = { version = "2", features = ["serde"] }
+regex = "1"
+notify = "6"
+inquire = "0.7"
+keyring = "3"
+open = "5"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+unreachable_pub = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+dbg_macro = "deny"
+missing_panics_doc = "warn"
+missing_errors_doc = "warn"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_docs_in_private_items = "allow"
+doc_markdown = "allow"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

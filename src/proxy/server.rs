@@ -1,0 +1,759 @@
+use bytes::Bytes;
+use http_body_util::{BodyExt, Empty, Full, combinators::BoxBody};
+use hyper::body::Incoming;
+use hyper::{Method, Request, Response, StatusCode, Uri};
+use hyper_util::rt::TokioIo;
+use notify::{EventKind, RecursiveMode, Watcher};
+use rustls::ServerConfig;
+use std::net::TcpListener as StdTcpListener;
+use std::sync::Arc;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::RwLock;
+use tokio_rustls::TlsAcceptor;
+use tracing::{debug, error, info, warn};
+
+use indexmap::IndexMap;
+
+use crate::error::{Error, Result};
+use crate::proxy::ca::{CertificateAuthority, generate_host_cert};
+use crate::proxy::config::{AuthConfig, EnvConfig, pid_path, port_path};
+
+/// Hop-by-hop headers that must not be forwarded.
+const HOP_BY_HOP: &[&str] = &[
+    "connection",
+    "proxy-connection",
+    "keep-alive",
+    "transfer-encoding",
+    "te",
+    "trailer",
+    "upgrade",
+    "proxy-authenticate",
+    "proxy-authorization",
+];
+
+fn is_hop_by_hop(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    HOP_BY_HOP.contains(&lower.as_str())
+}
+
+async fn fetch_oauth_token(
+    client_id: &str,
+    client_secret: &str,
+    token_url: &str,
+    scopes: &[String],
+    client: &reqwest::Client,
+) -> Result<(String, std::time::Duration)> {
+    let scope_str = scopes.join(" ");
+    let mut params = vec![
+        ("grant_type", "client_credentials"),
+        ("client_id", client_id),
+        ("client_secret", client_secret),
+    ];
+    if !scope_str.is_empty() {
+        params.push(("scope", scope_str.as_str()));
+    }
+
+    let resp = client
+        .post(token_url)
+        .form(&params)
+        .send()
+        .await
+        .map_err(|e| Error::cli(format!("OAuth2 token request failed: {e}")))?;
+
+    if !resp.status().is_success() {
+        return Err(Error::cli(format!(
+            "OAuth2 token endpoint returned {}",
+            resp.status()
+        )));
+    }
+
+    #[derive(serde::Deserialize)]
+    struct TokenResponse {
+        access_token: String,
+        expires_in: Option<u64>,
+    }
+
+    let body: TokenResponse = resp
+        .json()
+        .await
+        .map_err(|e| Error::cli(format!("Failed to parse OAuth2 response: {e}")))?;
+
+    let ttl = std::time::Duration::from_secs(body.expires_in.unwrap_or(3600));
+    Ok((body.access_token, ttl))
+}
+
+async fn get_cached_oauth_token(
+    cache_key: &str,
+    client_id: &str,
+    client_secret: &str,
+    token_url: &str,
+    scopes: &[String],
+    client: &reqwest::Client,
+    cache: &tokio::sync::Mutex<std::collections::HashMap<String, OAuthToken>>,
+) -> Result<String> {
+    {
+        let guard = cache.lock().await;
+        if let Some(tok) = guard.get(cache_key) {
+            // Refresh 60s before expiry
+            if tok.expires_at
+                > std::time::Instant::now() + std::time::Duration::from_secs(60)
+            {
+                return Ok(tok.access_token.clone());
+            }
+        }
+    }
+
+    let (access_token, ttl) =
+        fetch_oauth_token(client_id, client_secret, token_url, scopes, client).await?;
+
+    let mut guard = cache.lock().await;
+    guard.insert(
+        cache_key.to_string(),
+        OAuthToken {
+            access_token: access_token.clone(),
+            expires_at: std::time::Instant::now() + ttl,
+        },
+    );
+    Ok(access_token)
+}
+
+/// Cached OAuth2 token entry.
+#[derive(Debug)]
+struct OAuthToken {
+    access_token: String,
+    expires_at: std::time::Instant,
+}
+
+/// Shared state passed to every connection handler.
+struct ProxyState {
+    config: Arc<RwLock<EnvConfig>>,
+    ca: CertificateAuthority,
+    client: reqwest::Client,
+    oauth_cache: Arc<tokio::sync::Mutex<std::collections::HashMap<String, OAuthToken>>>,
+}
+
+/// Run the proxy daemon. This function does not return until the process exits.
+pub(crate) async fn run_daemon(env_dir: std::path::PathBuf) -> Result<()> {
+    // Load config and CA
+    let mut initial_config = EnvConfig::load(&env_dir)?;
+    initial_config.resolve_secrets();
+    let config = Arc::new(RwLock::new(initial_config));
+    let ca = crate::proxy::ca::ensure_global_ca()?;
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(false)
+        .build()
+        .map_err(|e| Error::cli(format!("Failed to build HTTP client: {e}")))?;
+
+    let state = Arc::new(ProxyState {
+        config: Arc::clone(&config),
+        ca,
+        client,
+        oauth_cache: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+    });
+
+    // Watch env_dir for changes and reload automatically
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        if let Ok(event) = res {
+            let is_modify = matches!(
+                event.kind,
+                EventKind::Modify(_) | EventKind::Create(_)
+            );
+            if is_modify {
+                let _ = tx.blocking_send(());
+            }
+        }
+    })
+    .map_err(|e| Error::cli(format!("Failed to create file watcher: {e}")))?;
+
+    watcher
+        .watch(&env_dir, RecursiveMode::NonRecursive)
+        .map_err(|e| Error::cli(format!("Failed to watch env dir: {e}")))?;
+
+    let config_for_watcher = Arc::clone(&config);
+    let env_dir_for_watcher = env_dir.clone();
+    tokio::spawn(async move {
+        // Keep watcher alive for the duration of this task
+        let _watcher = watcher;
+        while rx.recv().await.is_some() {
+            // Debounce: drain any queued events before reloading
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            while rx.try_recv().is_ok() {}
+
+            match EnvConfig::load(&env_dir_for_watcher) {
+                Ok(mut new_config) => {
+                    new_config.resolve_secrets();
+                    *config_for_watcher.write().await = new_config;
+                    info!("config reloaded");
+                }
+                Err(e) => warn!("Failed to reload config: {e}"),
+            }
+        }
+    });
+
+    // Bind on an OS-assigned port
+    let std_listener = StdTcpListener::bind("127.0.0.1:0")?;
+    let port = std_listener
+        .local_addr()
+        .map_err(|e| Error::cli(format!("Failed to get local address: {e}")))?
+        .port();
+    std_listener
+        .set_nonblocking(true)
+        .map_err(|e| Error::cli(format!("Failed to set non-blocking: {e}")))?;
+
+    let listener = TcpListener::from_std(std_listener)?;
+
+    // Write PID and port files so activate can read them
+    let pid = std::process::id();
+    std::fs::write(pid_path(&env_dir), pid.to_string())?;
+    std::fs::write(port_path(&env_dir), port.to_string())?;
+
+    tracing::info!("Proxy daemon listening on 127.0.0.1:{port} (PID {pid})");
+
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        debug!("Accepted connection from {peer}");
+        let state_clone = Arc::clone(&state);
+        let env_dir_clone = env_dir.clone();
+        tokio::spawn(async move {
+            if let Err(e) = handle_connection(stream, state_clone, env_dir_clone).await {
+                warn!("Connection error from {peer}: {e}");
+            }
+        });
+    }
+}
+
+async fn handle_connection(
+    stream: TcpStream,
+    state: Arc<ProxyState>,
+    env_dir: std::path::PathBuf,
+) -> Result<()> {
+    let io = TokioIo::new(stream);
+    let state_clone = Arc::clone(&state);
+    let env_dir_clone = env_dir.clone();
+
+    hyper::server::conn::http1::Builder::new()
+        .preserve_header_case(true)
+        .title_case_headers(true)
+        .serve_connection(
+            io,
+            hyper::service::service_fn(move |req| {
+                let state = Arc::clone(&state_clone);
+                let env_dir = env_dir_clone.clone();
+                async move { handle_request(req, state, env_dir).await }
+            }),
+        )
+        .with_upgrades()
+        .await
+        .map_err(|e| Error::cli(format!("HTTP connection error: {e}")))?;
+
+    Ok(())
+}
+
+/// The main request handler. Returns `Infallible` so errors become HTTP error responses.
+async fn handle_request(
+    req: Request<Incoming>,
+    state: Arc<ProxyState>,
+    env_dir: std::path::PathBuf,
+) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, std::convert::Infallible> {
+    if req.method() == Method::CONNECT {
+        Ok(handle_connect(req, state, env_dir))
+    } else {
+        Ok(handle_http(req, state).await)
+    }
+}
+
+/// Handle a plain HTTP proxy request (non-CONNECT).
+async fn handle_http(
+    req: Request<Incoming>,
+    state: Arc<ProxyState>,
+) -> Response<BoxBody<Bytes, hyper::Error>> {
+    let uri = req.uri().clone();
+
+    // Extract host from URI or Host header
+    let Some(host) = extract_host_from_request(&req, &uri) else {
+        return error_response(StatusCode::BAD_REQUEST, "Missing host");
+    };
+
+    let path = uri.path().to_string();
+
+    let (auth, extra_headers, body_inject, allowed, timeout) = {
+        let cfg = state.config.read().await;
+        let host_cfg = cfg.find_host_config(&host, &path);
+        let auth = host_cfg.and_then(|c| c.auth.clone());
+        let extra_headers = host_cfg
+            .map(|c| c.headers.clone())
+            .unwrap_or_default();
+        let body_inject = host_cfg
+            .map(|c| c.body.clone())
+            .unwrap_or_default();
+        let allowed = cfg.is_host_allowed(&host);
+        let timeout = host_cfg.and_then(|c| c.timeout_secs).or(cfg.proxy.timeout_secs);
+        (auth, extra_headers, body_inject, allowed, timeout)
+    };
+
+    if !allowed {
+        return error_response(StatusCode::FORBIDDEN, &format!("Host '{host}' is not in the allow list"));
+    }
+
+    // Build the forwarded URL
+    let mut target_url = match uri.to_string().parse::<reqwest::Url>() {
+        Ok(u) => u,
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("Invalid URL: {e}"),
+            );
+        }
+    };
+
+    // Apply query-param auth before building the request
+    if let Some(AuthConfig::Query { ref param, value: Some(ref value) }) = auth {
+        target_url.query_pairs_mut().append_pair(param, value);
+    }
+
+    let method = match reqwest::Method::from_bytes(req.method().as_str().as_bytes()) {
+        Ok(m) => m,
+        Err(e) => {
+            return error_response(StatusCode::BAD_REQUEST, &format!("Invalid method: {e}"));
+        }
+    };
+
+    let mut builder = state.client.request(method, target_url);
+
+    // Copy headers, skipping hop-by-hop
+    for (name, value) in req.headers() {
+        if is_hop_by_hop(name.as_str()) {
+            continue;
+        }
+        if name == hyper::header::HOST {
+            continue;
+        }
+        builder = builder.header(name.as_str(), value.as_bytes());
+    }
+
+    // Inject extra headers
+    for (name, value) in &extra_headers {
+        builder = builder.header(name.as_str(), value.as_bytes());
+    }
+
+    // Inject auth
+    match auth {
+        Some(AuthConfig::Bearer { token: Some(token) }) => {
+            builder = builder.header("Authorization", format!("Bearer {token}"));
+        }
+        Some(AuthConfig::Bearer { token: None }) => {
+            return error_response(StatusCode::UNAUTHORIZED, &format!("No secret for '{host}' — run `statespace wenv add`"));
+        }
+        Some(AuthConfig::Header { name, value: Some(value) }) => {
+            builder = builder.header(name.as_str(), value.as_bytes());
+        }
+        Some(AuthConfig::Header { value: None, .. }) => {
+            return error_response(StatusCode::UNAUTHORIZED, &format!("No secret for '{host}' — run `statespace wenv add`"));
+        }
+        Some(AuthConfig::Query { .. }) => { /* already applied to URL */ }
+        Some(AuthConfig::OAuth2 {
+            client_id: Some(client_id),
+            client_secret: Some(client_secret),
+            token_url,
+            scopes,
+        }) => {
+            match get_cached_oauth_token(
+                &host,
+                &client_id,
+                &client_secret,
+                &token_url,
+                &scopes,
+                &state.client,
+                &state.oauth_cache,
+            )
+            .await
+            {
+                Ok(token) => {
+                    builder = builder.header("Authorization", format!("Bearer {token}"));
+                }
+                Err(e) => {
+                    return error_response(
+                        StatusCode::UNAUTHORIZED,
+                        &format!("OAuth2 error: {e}"),
+                    );
+                }
+            }
+        }
+        Some(AuthConfig::OAuth2 { .. }) => {
+            return error_response(StatusCode::UNAUTHORIZED, &format!("No OAuth2 credentials for '{host}' — run `statespace wenv add`"));
+        }
+        None => {}
+    }
+
+    // Apply timeout
+    if let Some(secs) = timeout {
+        builder = builder.timeout(std::time::Duration::from_secs(secs));
+    }
+
+    // Collect body and optionally inject into JSON fields
+    let body_bytes = match req.collect().await {
+        Ok(b) => b.to_bytes(),
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                &format!("Failed to read request body: {e}"),
+            );
+        }
+    };
+    let body_bytes = inject_into_body(body_bytes, &body_inject);
+    builder = builder.body(body_bytes);
+
+    let upstream = match builder.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return error_response(StatusCode::BAD_GATEWAY, &format!("Upstream error: {e}"));
+        }
+    };
+
+    let response_status = upstream.status();
+    let response_headers = upstream.headers().clone();
+    let response_body = match upstream.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            error!("Failed to read upstream body: {e}");
+            Bytes::new()
+        }
+    };
+
+    build_response_from_parts(response_status, &response_headers, response_body)
+}
+
+/// Handle a CONNECT tunnel request (HTTPS MITM).
+fn handle_connect(
+    req: Request<Incoming>,
+    state: Arc<ProxyState>,
+    _env_dir: std::path::PathBuf,
+) -> Response<BoxBody<Bytes, hyper::Error>> {
+    let host_and_port = req
+        .uri()
+        .authority()
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    let hostname = host_and_port
+        .split(':')
+        .next()
+        .unwrap_or(&host_and_port)
+        .to_string();
+
+    // Send 200 Connection Established immediately
+    let response = match Response::builder()
+        .status(StatusCode::OK)
+        .body(empty_body())
+    {
+        Ok(r) => r,
+        Err(e) => {
+            error!("Failed to build CONNECT response: {e}");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+        }
+    };
+
+    // Upgrade the connection and do MITM in a background task
+    tokio::spawn(async move {
+        let upgraded = match hyper::upgrade::on(req).await {
+            Ok(u) => u,
+            Err(e) => {
+                error!("Upgrade failed for {hostname}: {e}");
+                return;
+            }
+        };
+
+        if let Err(e) = mitm_tls(upgraded, hostname, state).await {
+            debug!("MITM error: {e}");
+        }
+    });
+
+    response
+}
+
+/// Perform TLS MITM for a CONNECT-tunneled connection.
+async fn mitm_tls(
+    upgraded: hyper::upgrade::Upgraded,
+    hostname: String,
+    state: Arc<ProxyState>,
+) -> Result<()> {
+    // Generate a cert for this hostname signed by our CA
+    let (host_cert, host_key) = generate_host_cert(&hostname, &state.ca)?;
+
+    let cert_der = host_cert.der().clone();
+    let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
+        rustls::pki_types::PrivatePkcs8KeyDer::from(host_key.serialize_der()),
+    );
+
+    let tls_config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key_der)
+        .map_err(|e| Error::cli(format!("Failed to build TLS server config: {e}")))?;
+
+    let acceptor = TlsAcceptor::from(Arc::new(tls_config));
+    let io = TokioIo::new(upgraded);
+    let tls_stream = acceptor
+        .accept(io)
+        .await
+        .map_err(|e| Error::cli(format!("TLS handshake failed for {hostname}: {e}")))?;
+
+    let tls_io = TokioIo::new(tls_stream);
+    let state_clone = Arc::clone(&state);
+    let hostname_clone = hostname.clone();
+
+    hyper::server::conn::http1::Builder::new()
+        .preserve_header_case(true)
+        .title_case_headers(true)
+        .serve_connection(
+            tls_io,
+            hyper::service::service_fn(move |req| {
+                let state = Arc::clone(&state_clone);
+                let host = hostname_clone.clone();
+                async move { handle_inner_https(req, state, host).await }
+            }),
+        )
+        .await
+        .map_err(|e| Error::cli(format!("Inner HTTPS connection error: {e}")))?;
+
+    Ok(())
+}
+
+/// Handle an inner (post-MITM) HTTPS request.
+async fn handle_inner_https(
+    req: Request<Incoming>,
+    state: Arc<ProxyState>,
+    hostname: String,
+) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, std::convert::Infallible> {
+    let path = req.uri().path().to_string();
+
+    let (auth, extra_headers, body_inject, allowed, timeout) = {
+        let cfg = state.config.read().await;
+        let host_cfg = cfg.find_host_config(&hostname, &path);
+        let auth = host_cfg.and_then(|c| c.auth.clone());
+        let extra_headers = host_cfg
+            .map(|c| c.headers.clone())
+            .unwrap_or_default();
+        let body_inject = host_cfg
+            .map(|c| c.body.clone())
+            .unwrap_or_default();
+        let allowed = cfg.is_host_allowed(&hostname);
+        let timeout = host_cfg.and_then(|c| c.timeout_secs).or(cfg.proxy.timeout_secs);
+        (auth, extra_headers, body_inject, allowed, timeout)
+    };
+
+    if !allowed {
+        return Ok(error_response(StatusCode::FORBIDDEN, &format!("Host '{hostname}' is not in the allow list")));
+    }
+
+    // Reconstruct the full URL
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map_or("/", hyper::http::uri::PathAndQuery::as_str);
+    let full_url = format!("https://{hostname}{path_and_query}");
+
+    let mut url = match full_url.parse::<reqwest::Url>() {
+        Ok(u) => u,
+        Err(e) => {
+            return Ok(error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("Invalid URL: {e}"),
+            ));
+        }
+    };
+
+    // Apply query-param auth before building the request
+    if let Some(AuthConfig::Query { ref param, value: Some(ref value) }) = auth {
+        url.query_pairs_mut().append_pair(param, value);
+    }
+
+    let method = match reqwest::Method::from_bytes(req.method().as_str().as_bytes()) {
+        Ok(m) => m,
+        Err(e) => {
+            return Ok(error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("Invalid method: {e}"),
+            ));
+        }
+    };
+
+    let mut builder = state.client.request(method, url);
+
+    for (name, value) in req.headers() {
+        if is_hop_by_hop(name.as_str()) {
+            continue;
+        }
+        if name == hyper::header::HOST {
+            continue;
+        }
+        builder = builder.header(name.as_str(), value.as_bytes());
+    }
+
+    // Inject extra headers
+    for (name, value) in &extra_headers {
+        builder = builder.header(name.as_str(), value.as_bytes());
+    }
+
+    // Inject auth
+    match auth {
+        Some(AuthConfig::Bearer { token: Some(token) }) => {
+            builder = builder.header("Authorization", format!("Bearer {token}"));
+        }
+        Some(AuthConfig::Bearer { token: None }) => {
+            return Ok(error_response(StatusCode::UNAUTHORIZED, &format!("No secret for '{hostname}' — run `statespace wenv add`")));
+        }
+        Some(AuthConfig::Header { name, value: Some(value) }) => {
+            builder = builder.header(name.as_str(), value.as_bytes());
+        }
+        Some(AuthConfig::Header { value: None, .. }) => {
+            return Ok(error_response(StatusCode::UNAUTHORIZED, &format!("No secret for '{hostname}' — run `statespace wenv add`")));
+        }
+        Some(AuthConfig::Query { .. }) => { /* already applied to URL */ }
+        Some(AuthConfig::OAuth2 {
+            client_id: Some(client_id),
+            client_secret: Some(client_secret),
+            token_url,
+            scopes,
+        }) => {
+            match get_cached_oauth_token(
+                &hostname,
+                &client_id,
+                &client_secret,
+                &token_url,
+                &scopes,
+                &state.client,
+                &state.oauth_cache,
+            )
+            .await
+            {
+                Ok(token) => {
+                    builder = builder.header("Authorization", format!("Bearer {token}"));
+                }
+                Err(e) => {
+                    return Ok(error_response(
+                        StatusCode::UNAUTHORIZED,
+                        &format!("OAuth2 error: {e}"),
+                    ));
+                }
+            }
+        }
+        Some(AuthConfig::OAuth2 { .. }) => {
+            return Ok(error_response(StatusCode::UNAUTHORIZED, &format!("No OAuth2 credentials for '{hostname}' — run `statespace wenv add`")));
+        }
+        None => {}
+    }
+
+    // Apply timeout
+    if let Some(secs) = timeout {
+        builder = builder.timeout(std::time::Duration::from_secs(secs));
+    }
+
+    let body_bytes = match req.collect().await {
+        Ok(b) => b.to_bytes(),
+        Err(e) => {
+            return Ok(error_response(
+                StatusCode::BAD_GATEWAY,
+                &format!("Failed to read request body: {e}"),
+            ));
+        }
+    };
+    let body_bytes = inject_into_body(body_bytes, &body_inject);
+    builder = builder.body(body_bytes);
+
+    let upstream = match builder.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return Ok(error_response(
+                StatusCode::BAD_GATEWAY,
+                &format!("Upstream error: {e}"),
+            ));
+        }
+    };
+
+    let response_status = upstream.status();
+    let response_headers = upstream.headers().clone();
+    let response_body = match upstream.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            error!("Failed to read upstream body: {e}");
+            Bytes::new()
+        }
+    };
+
+    Ok(build_response_from_parts(response_status, &response_headers, response_body))
+}
+
+/// Merge configured key/value pairs into the named top-level fields of a JSON body.
+/// If the body is not valid JSON or the named field is not an object, the body is returned unchanged.
+fn inject_into_body(
+    body_bytes: Bytes,
+    inject: &IndexMap<String, IndexMap<String, String>>,
+) -> Bytes {
+    if inject.is_empty() || body_bytes.is_empty() {
+        return body_bytes;
+    }
+    let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&body_bytes) else {
+        return body_bytes;
+    };
+    let Some(obj) = json.as_object_mut() else {
+        return body_bytes;
+    };
+    for (field, values) in inject {
+        let entry = obj
+            .entry(field)
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        if let Some(field_obj) = entry.as_object_mut() {
+            for (k, v) in values {
+                field_obj.insert(k.clone(), serde_json::Value::String(v.clone()));
+            }
+        }
+    }
+    serde_json::to_vec(&json)
+        .map(Bytes::from)
+        .unwrap_or(body_bytes)
+}
+
+fn build_response_from_parts(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    body_bytes: Bytes,
+) -> Response<BoxBody<Bytes, hyper::Error>> {
+    let status_code = StatusCode::from_u16(status.as_u16())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let mut builder = Response::builder().status(status_code);
+    for (name, value) in headers {
+        if is_hop_by_hop(name.as_str()) {
+            continue;
+        }
+        builder = builder.header(name.as_str(), value.as_bytes());
+    }
+    match builder.body(Full::new(body_bytes).map_err(|e| match e {}).boxed()) {
+        Ok(r) => r,
+        Err(_) => Response::new(empty_body()),
+    }
+}
+
+fn empty_body() -> BoxBody<Bytes, hyper::Error> {
+    Empty::<Bytes>::new().map_err(|e| match e {}).boxed()
+}
+
+fn error_response(status: StatusCode, msg: &str) -> Response<BoxBody<Bytes, hyper::Error>> {
+    let body = Bytes::from(msg.to_string());
+    match Response::builder()
+        .status(status)
+        .body(Full::new(body).map_err(|e| match e {}).boxed())
+    {
+        Ok(r) => r,
+        Err(_) => Response::new(empty_body()),
+    }
+}
+
+fn extract_host_from_request(req: &Request<Incoming>, uri: &Uri) -> Option<String> {
+    if let Some(host) = uri.host() {
+        return Some(host.to_string());
+    }
+    req.headers()
+        .get(hyper::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
