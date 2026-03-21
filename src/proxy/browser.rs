@@ -9,14 +9,12 @@
 use std::sync::Arc;
 
 use reqwest_cookie_store::CookieStoreMutex;
-use tracing::{info, warn};
-use wry::{
-    application::{
-        event_loop::{ControlFlow, EventLoop},
-        window::WindowBuilder,
-    },
-    webview::WebViewBuilder,
+use tao::{
+    event_loop::{ControlFlow, EventLoop},
+    window::WindowBuilder,
 };
+use tracing::{info, warn};
+use wry::{ProxyConfig, ProxyEndpoint, WebViewBuilder};
 
 use crate::error::Error;
 
@@ -140,7 +138,7 @@ pub(crate) fn run_auth_window(url: &str, proxy_port: u16) -> ! {
 
 fn try_run_auth_window(
     url: &str,
-    _proxy_port: u16,
+    proxy_port: u16,
 ) -> crate::error::Result<std::convert::Infallible> {
     eprintln!("nv: opening browser for authentication — log in, then close this window.");
 
@@ -152,10 +150,15 @@ fn try_run_auth_window(
         .build(&event_loop)
         .map_err(|e| Error::cli(format!("Failed to create window: {e}")))?;
 
-    let _webview = WebViewBuilder::new(window)
-        .map_err(|e| Error::cli(format!("Failed to create webview: {e}")))?
+    let proxy_config = ProxyConfig::Http(ProxyEndpoint {
+        host: "127.0.0.1".to_string(),
+        port: proxy_port.to_string(),
+    });
+
+    let _webview = WebViewBuilder::new(&window)
         .with_url(url)
         .map_err(|e| Error::cli(format!("Invalid auth URL: {e}")))?
+        .with_proxy_config(proxy_config)
         .build()
         .map_err(|e| Error::cli(format!("Failed to create webview: {e}")))?;
 
