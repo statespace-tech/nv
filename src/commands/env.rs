@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::args::{
-    AddArgs, BrowseArgs, DaemonArgs, ListArgs, PortArgs, RemoveArgs, RunArgs, StopArgs, TrustArgs,
+    AddArgs, DaemonArgs, ListArgs, PortArgs, RemoveArgs, RunArgs, StopArgs, TrustArgs,
     UntrustArgs,
 };
 use crate::error::{Error, Result};
@@ -114,26 +114,54 @@ echo "nv [{env_name}] active (port $_NV_PORT). Run 'deactivate' to stop."
     Ok(())
 }
 
-pub(crate) fn run_add(args: AddArgs) -> Result<()> {
+pub(crate) async fn run_add(args: AddArgs) -> Result<()> {
     let project_dir = resolve_project_dir(&args.path)?;
     validate_project_dir(&project_dir)?;
 
+    // Device flow — runs entirely async, stores result as Bearer
+    if args.device_flow {
+        return run_device_flow(args, &project_dir).await;
+    }
+
     let auth = if args.bearer || (!args.oauth2 && args.header.is_none() && args.query.is_none()) {
-        let secret = prompt_secret("Bearer token")?;
+        let secret = if args.browser {
+            crate::proxy::browser::collect_via_browser(&args.host, "Paste your API key or token").await?
+        } else {
+            prompt_secret("Bearer token")?
+        };
         crate::proxy::keychain::store(&args.host, "token", &secret)?;
         AuthConfig::Bearer { token: None }
     } else if let Some(header_name) = args.header {
-        let secret = prompt_secret(&format!("Value for header '{header_name}'"))?;
+        let secret = if args.browser {
+            crate::proxy::browser::collect_via_browser(
+                &args.host,
+                &format!("Value for header '{header_name}'"),
+            ).await?
+        } else {
+            prompt_secret(&format!("Value for header '{header_name}'"))?
+        };
         crate::proxy::keychain::store(&args.host, "value", &secret)?;
         AuthConfig::Header { name: header_name, value: None }
     } else if let Some(param) = args.query {
-        let secret = prompt_secret(&format!("Value for query param '{param}'"))?;
+        let secret = if args.browser {
+            crate::proxy::browser::collect_via_browser(
+                &args.host,
+                &format!("Value for query param '{param}'"),
+            ).await?
+        } else {
+            prompt_secret(&format!("Value for query param '{param}'"))?
+        };
         crate::proxy::keychain::store(&args.host, "value", &secret)?;
         AuthConfig::Query { param, value: None }
     } else {
         let token_url = args.token_url.ok_or_else(|| Error::cli("--token-url is required for --oauth2"))?;
-        let client_id = prompt_secret("OAuth2 client ID")?;
-        let client_secret = prompt_secret("OAuth2 client secret")?;
+        let (client_id, client_secret) = if args.browser {
+            let id = crate::proxy::browser::collect_via_browser(&args.host, "OAuth2 client ID").await?;
+            let secret = crate::proxy::browser::collect_via_browser(&args.host, "OAuth2 client secret").await?;
+            (id, secret)
+        } else {
+            (prompt_secret("OAuth2 client ID")?, prompt_secret("OAuth2 client secret")?)
+        };
         crate::proxy::keychain::store(&args.host, "client_id", &client_id)?;
         crate::proxy::keychain::store(&args.host, "client_secret", &client_secret)?;
         AuthConfig::OAuth2 {
@@ -154,6 +182,183 @@ pub(crate) fn run_add(args: AddArgs) -> Result<()> {
 
     println!("Auth configured for '{}' (secret stored in keychain).", args.host);
     Ok(())
+}
+
+async fn run_device_flow(args: AddArgs, project_dir: &std::path::Path) -> Result<()> {
+    let host = &args.host;
+
+    // Resolve device code URL and token URL for known vs unknown services
+    let (device_url, token_url) = resolve_device_flow_endpoints(
+        host,
+        args.device_url.as_deref(),
+        args.token_url.as_deref(),
+    )?;
+
+    // Client ID — required; infer for known services or require --client-id
+    let client_id = args
+        .client_id
+        .or_else(|| builtin_client_id(host))
+        .ok_or_else(|| {
+            Error::cli(format!(
+                "--client-id is required for device flow with unknown service '{host}'"
+            ))
+        })?;
+
+    let scope_str = args.scopes.join(" ");
+
+    // Step 1: request device code
+    let http = reqwest::Client::new();
+    let mut params = vec![("client_id", client_id.as_str())];
+    if !scope_str.is_empty() {
+        params.push(("scope", scope_str.as_str()));
+    }
+
+    #[derive(serde::Deserialize)]
+    struct DeviceCodeResponse {
+        device_code: String,
+        user_code: String,
+        verification_uri: String,
+        #[serde(default = "default_interval")]
+        interval: u64,
+        expires_in: Option<u64>,
+    }
+    fn default_interval() -> u64 { 5 }
+
+    let resp = http
+        .post(&device_url)
+        .header("Accept", "application/json")
+        .form(&params)
+        .send()
+        .await
+        .map_err(|e| Error::cli(format!("Device code request failed: {e}")))?;
+
+    if !resp.status().is_success() {
+        return Err(Error::cli(format!(
+            "Device code endpoint returned {}",
+            resp.status()
+        )));
+    }
+
+    let device: DeviceCodeResponse = resp
+        .json()
+        .await
+        .map_err(|e| Error::cli(format!("Failed to parse device code response: {e}")))?;
+
+    // Step 2: instruct the user
+    println!();
+    println!("  Open this URL in your browser:");
+    println!("  {}", device.verification_uri);
+    println!();
+    println!("  Enter code:  {}", device.user_code);
+    println!();
+
+    // Open the browser automatically
+    let _ = open::that(&device.verification_uri);
+
+    // Step 3: poll for the token
+    let expires_secs = device.expires_in.unwrap_or(900);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(expires_secs);
+    let interval = std::time::Duration::from_secs(device.interval);
+
+    #[derive(serde::Deserialize)]
+    struct TokenResponse {
+        access_token: Option<String>,
+        error: Option<String>,
+    }
+
+    println!("Waiting for authorization\u{2026}");
+
+    loop {
+        tokio::time::sleep(interval).await;
+
+        if std::time::Instant::now() > deadline {
+            return Err(Error::cli("Device flow authorization timed out"));
+        }
+
+        let poll_resp = http
+            .post(&token_url)
+            .header("Accept", "application/json")
+            .form(&[
+                ("client_id", client_id.as_str()),
+                ("device_code", device.device_code.as_str()),
+                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+            ])
+            .send()
+            .await
+            .map_err(|e| Error::cli(format!("Token poll failed: {e}")))?;
+
+        let tok: TokenResponse = poll_resp
+            .json()
+            .await
+            .map_err(|e| Error::cli(format!("Failed to parse token response: {e}")))?;
+
+        match tok.error.as_deref() {
+            Some("authorization_pending") | Some("slow_down") => continue,
+            Some("expired_token") => {
+                return Err(Error::cli("Device flow expired — run nv add again"))
+            }
+            Some("access_denied") => return Err(Error::cli("Authorization denied by user")),
+            Some(other) => return Err(Error::cli(format!("Device flow error: {other}"))),
+            None => {}
+        }
+
+        if let Some(token) = tok.access_token {
+            crate::proxy::keychain::store(host, "token", &token)?;
+
+            let mut config = EnvConfig::load(project_dir)?;
+            config
+                .hosts
+                .entry(host.clone())
+                .or_insert_with(HostConfig::default)
+                .auth = Some(AuthConfig::Bearer { token: None });
+            config.save(project_dir)?;
+
+            println!("Authorized \u{2713}  {host} requests will use Bearer token.");
+            return Ok(());
+        }
+    }
+}
+
+fn resolve_device_flow_endpoints(
+    host: &str,
+    device_url: Option<&str>,
+    token_url: Option<&str>,
+) -> Result<(String, String)> {
+    // Built-in known services
+    let known: Option<(&str, &str)> = match host {
+        "github.com" | "api.github.com" => Some((
+            "https://github.com/login/device/code",
+            "https://github.com/login/oauth/access_token",
+        )),
+        "gitlab.com" => Some((
+            "https://gitlab.com/oauth/authorize_device",
+            "https://gitlab.com/oauth/token",
+        )),
+        _ => None,
+    };
+
+    let (d, t) = if let Some((d, t)) = known {
+        (
+            device_url.unwrap_or(d).to_string(),
+            token_url.unwrap_or(t).to_string(),
+        )
+    } else {
+        let d = device_url
+            .ok_or_else(|| Error::cli("--device-url is required for unknown service"))?;
+        let t = token_url
+            .ok_or_else(|| Error::cli("--token-url is required for unknown service"))?;
+        (d.to_string(), t.to_string())
+    };
+
+    Ok((d, t))
+}
+
+/// Returns a built-in OAuth client ID for well-known services.
+/// Returns `None` for unknown services (user must pass `--client-id`).
+fn builtin_client_id(_host: &str) -> Option<String> {
+    // Future: embed nv's own registered OAuth App client IDs here.
+    // For now all services require --client-id.
+    None
 }
 
 fn prompt_secret(label: &str) -> Result<String> {
@@ -363,19 +568,6 @@ pub(crate) async fn run_port(args: PortArgs) -> Result<()> {
     Ok(())
 }
 
-pub(crate) async fn run_browse(args: BrowseArgs) -> Result<()> {
-    let project_dir = resolve_project_dir(&args.path)?;
-    validate_project_dir(&project_dir)?;
-
-    let port = ensure_daemon_running(&project_dir).await?;
-
-    crate::proxy::browser::open_with_proxy(&args.url, port)
-        .map_err(|e| Error::cli(format!("Failed to open browser: {e}")))?;
-
-    println!("Browser opened. Log in, then close the window when done.");
-    println!("Session cookies will persist for the lifetime of the proxy.");
-    Ok(())
-}
 
 #[cfg(target_os = "linux")]
 fn trust_linux(cert_str: &str) -> Result<()> {

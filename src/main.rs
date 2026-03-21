@@ -8,17 +8,6 @@ use clap::Parser;
 use error::Result;
 
 fn main() {
-    // `_auth` opens a wry window whose event loop must run on the OS main thread —
-    // handle it synchronously before the tokio runtime is created.
-    let raw: Vec<String> = std::env::args().collect();
-    if raw.get(1).map(String::as_str) == Some("_auth") {
-        let cli = Cli::parse();
-        if let Commands::Auth(a) = cli.command {
-            proxy::browser::run_auth_window(&a.url, a.proxy_port);
-        }
-        return;
-    }
-
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
@@ -38,7 +27,7 @@ async fn run() -> Result<()> {
 
     match cli.command {
         Commands::Init(InitArgs { path, name }) => commands::env::run_create(&path, name.as_deref()),
-        Commands::Add(a) => commands::env::run_add(a),
+        Commands::Add(a) => commands::env::run_add(a).await,
         Commands::Remove(ref a) => commands::env::run_remove(a),
         Commands::List(ref a) => commands::env::run_list(a),
         Commands::Run(a) => commands::env::run_run(a).await,
@@ -47,8 +36,5 @@ async fn run() -> Result<()> {
         Commands::Daemon(a) => commands::env::run_daemon_cmd(a).await,
         Commands::Stop(ref a) => commands::env::run_stop(a),
         Commands::Port(a) => commands::env::run_port(a).await,
-        Commands::Browse(a) => commands::env::run_browse(a).await,
-        // Handled synchronously in main() before the runtime starts
-        Commands::Auth(_) => Ok(()),
     }
 }
