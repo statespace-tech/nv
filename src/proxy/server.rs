@@ -4,9 +4,7 @@ use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode, Uri};
 use hyper_util::rt::TokioIo;
 use notify::{EventKind, RecursiveMode, Watcher};
-use reqwest_cookie_store::CookieStoreMutex;
 use rustls::ServerConfig;
-use std::collections::HashSet;
 use std::net::TcpListener as StdTcpListener;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
@@ -19,7 +17,7 @@ use indexmap::IndexMap;
 use crate::error::{Error, Result};
 use crate::proxy::ca::{CertificateAuthority, generate_host_cert};
 use crate::proxy::config::{
-    AuthConfig, EnvConfig, config_path, pid_path, port_path, runtime_dir, sessions_path,
+    AuthConfig, EnvConfig, config_path, pid_path, port_path, runtime_dir,
 };
 
 /// Hop-by-hop headers that must not be forwarded.
@@ -135,14 +133,6 @@ struct ProxyState {
     ca: CertificateAuthority,
     client: reqwest::Client,
     oauth_cache: Arc<tokio::sync::Mutex<std::collections::HashMap<String, OAuthToken>>>,
-    /// Inspectable cookie jar — shared with the reqwest client via cookie_provider.
-    cookie_store: Arc<CookieStoreMutex>,
-    /// The port this daemon is listening on (passed to browser auth windows).
-    port: u16,
-    /// Project directory (used for sessions file and keychain key).
-    project_dir: std::path::PathBuf,
-    /// Hosts for which a browser auth window is currently open.
-    browser_auth_in_progress: Arc<tokio::sync::Mutex<HashSet<String>>>,
 }
 
 /// Run the proxy daemon. This function does not return until the process exits.
@@ -157,29 +147,9 @@ pub(crate) async fn run_daemon(project_dir: std::path::PathBuf) -> Result<()> {
     let config = Arc::new(RwLock::new(initial_config));
     let ca = crate::proxy::ca::ensure_global_ca()?;
 
-    // Inspectable cookie jar — restore from keychain if available
-    let cookie_store = Arc::new(CookieStoreMutex::default());
-    let keychain_key = project_dir.to_string_lossy().into_owned();
-    if let Some(json) = crate::proxy::keychain::get("sessions", &keychain_key) {
-        crate::proxy::browser::restore_cookies(&json, &cookie_store);
-    }
-
-    // Build reqwest client with:
-    //  - custom redirect policy that stops at login-wall redirects
-    //  - shared inspectable cookie jar
-    let cookie_store_for_client = Arc::clone(&cookie_store);
+    // Build reqwest client
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(false)
-        .cookie_provider(cookie_store_for_client)
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            if crate::proxy::browser::is_login_redirect(attempt.url()) {
-                attempt.stop()
-            } else if attempt.previous().len() > 10 {
-                attempt.error("too many redirects")
-            } else {
-                attempt.follow()
-            }
-        }))
         .build()
         .map_err(|e| Error::cli(format!("Failed to build HTTP client: {e}")))?;
 
@@ -199,10 +169,6 @@ pub(crate) async fn run_daemon(project_dir: std::path::PathBuf) -> Result<()> {
         ca,
         client,
         oauth_cache: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        cookie_store,
-        port,
-        project_dir: project_dir.clone(),
-        browser_auth_in_progress: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
     });
 
     // Watch nv.toml for changes and reload automatically
@@ -256,98 +222,6 @@ pub(crate) async fn run_daemon(project_dir: std::path::PathBuf) -> Result<()> {
             }
         });
     }
-}
-
-/// Poll the cookie store until cookies arrive for `host` or the timeout elapses.
-async fn wait_for_browser_auth(
-    host: &str,
-    cookie_store: &Arc<CookieStoreMutex>,
-    timeout_secs: u64,
-) -> bool {
-    let deadline =
-        tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    while tokio::time::Instant::now() < deadline {
-        if crate::proxy::browser::has_cookies_for_host(host, cookie_store) {
-            return true;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    }
-    false
-}
-
-/// Persist the cookie jar to the OS keychain and update the agent-readable
-/// sessions file in `.nv/sessions`.
-fn persist_session(host: &str, state: &ProxyState) {
-    // Save cookie jar to keychain
-    let keychain_key = state.project_dir.to_string_lossy().into_owned();
-    if let Some(json) = crate::proxy::browser::serialize_cookies(&state.cookie_store) {
-        if let Err(e) = crate::proxy::keychain::store("sessions", &keychain_key, &json) {
-            warn!("Failed to persist session cookies to keychain: {e}");
-        }
-    }
-
-    // Update .nv/sessions — agent-readable list of authenticated hosts
-    let sessions_file = sessions_path(&state.project_dir);
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    // Read existing sessions, add/update this host
-    let mut sessions: serde_json::Map<String, serde_json::Value> =
-        std::fs::read_to_string(&sessions_file)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
-
-    sessions.insert(
-        host.to_string(),
-        serde_json::json!({ "authenticated_at": timestamp }),
-    );
-
-    if let Ok(json) = serde_json::to_string_pretty(&serde_json::Value::Object(sessions)) {
-        if let Err(e) = std::fs::write(&sessions_file, json) {
-            warn!("Failed to write sessions file: {e}");
-        }
-    }
-
-    info!("Session persisted for {host}");
-}
-
-/// Classify whether a response requires browser authentication.
-enum AuthNeeded {
-    /// No auth required.
-    No,
-    /// 401/403 — open the host's root login page.
-    ApiAuth,
-    /// Redirect to a login wall — open that URL directly.
-    LoginRedirect(String),
-}
-
-fn classify_response(
-    status: reqwest::StatusCode,
-    headers: &reqwest::header::HeaderMap,
-    base_url: &reqwest::Url,
-) -> AuthNeeded {
-    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        return AuthNeeded::ApiAuth;
-    }
-
-    if status.is_redirection() {
-        if let Some(location) = headers.get(reqwest::header::LOCATION) {
-            if let Ok(loc_str) = location.to_str() {
-                let resolved = reqwest::Url::parse(loc_str)
-                    .or_else(|_| base_url.join(loc_str));
-                if let Ok(loc_url) = resolved {
-                    if crate::proxy::browser::is_login_redirect(&loc_url) {
-                        return AuthNeeded::LoginRedirect(loc_url.to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    AuthNeeded::No
 }
 
 async fn handle_connection(
@@ -446,7 +320,6 @@ async fn handle_http(
     let body_bytes = inject_into_body(body_bytes, &body_inject);
 
     let mut force_token_refresh = false;
-    let mut browser_auth_attempted = false;
     loop {
         let mut target_url = base_url.clone();
 
@@ -490,19 +363,6 @@ async fn handle_http(
             continue;
         }
 
-        // Browser auth: 401, 403, or redirect to login wall
-        if auth.is_none() && !browser_auth_attempted {
-            let needs_auth =
-                classify_response(upstream.status(), upstream.headers(), &base_url);
-            if let Some(response) =
-                try_browser_auth(&host, needs_auth, &state, &mut browser_auth_attempted).await
-            {
-                if response {
-                    continue;
-                }
-            }
-        }
-
         let response_status = upstream.status();
         let response_headers = upstream.headers().clone();
         let response_body = match upstream.bytes().await {
@@ -513,59 +373,21 @@ async fn handle_http(
             }
         };
 
-        return build_response_from_parts(response_status, &response_headers, response_body);
-    }
-}
+        let mut resp = build_response_from_parts(response_status, &response_headers, response_body);
 
-/// Attempt browser auth if needed. Returns `Some(true)` to retry the request,
-/// `Some(false)` to continue without retry, `None` if no auth was needed.
-async fn try_browser_auth(
-    host: &str,
-    needs_auth: AuthNeeded,
-    state: &ProxyState,
-    browser_auth_attempted: &mut bool,
-) -> Option<bool> {
-    let open_url = match needs_auth {
-        AuthNeeded::No => return None,
-        AuthNeeded::ApiAuth => crate::proxy::browser::auth_url(host, None),
-        AuthNeeded::LoginRedirect(ref url) => url.clone(),
-    };
-
-    let mut in_progress = state.browser_auth_in_progress.lock().await;
-    if !in_progress.contains(host) {
-        in_progress.insert(host.to_string());
-        drop(in_progress);
-
-        match crate::proxy::browser::open_with_proxy(&open_url, state.port) {
-            Ok(mut child) => {
-                info!("Browser auth required for {host} — opening {open_url}");
-                eprintln!("nv: authentication required for {host} — browser window opened.");
-                let got_cookies =
-                    wait_for_browser_auth(host, &state.cookie_store, 300).await;
-                let _ = child.kill();
-                if got_cookies {
-                    info!("Browser auth complete for {host}");
-                    eprintln!("nv: authenticated ✓ {host}");
-                    persist_session(host, state);
-                    *browser_auth_attempted = true;
-                    state.browser_auth_in_progress.lock().await.remove(host);
-                    return Some(true);
-                }
-                warn!("Browser auth timed out or cancelled for {host}");
-                eprintln!("nv: authentication cancelled or timed out for {host}");
+        // When no auth is configured and upstream says 401/403, hint how to fix it
+        if auth.is_none()
+            && (response_status == reqwest::StatusCode::UNAUTHORIZED
+                || response_status == reqwest::StatusCode::FORBIDDEN)
+        {
+            let hint = auth_hint_command(&host);
+            if let Ok(v) = hyper::header::HeaderValue::from_str(&hint) {
+                resp.headers_mut().insert("x-nv-auth-hint", v);
             }
-            Err(e) => warn!("Failed to open browser auth window: {e}"),
         }
 
-        state.browser_auth_in_progress.lock().await.remove(host);
-    } else {
-        drop(in_progress);
-        // Another concurrent request already opened the window; wait for it
-        let _got = wait_for_browser_auth(host, &state.cookie_store, 300).await;
+        return resp;
     }
-
-    *browser_auth_attempted = true;
-    Some(false)
 }
 
 /// Handle a CONNECT tunnel request (HTTPS MITM).
@@ -726,7 +548,6 @@ async fn handle_inner_https(
     let body_bytes = inject_into_body(body_bytes, &body_inject);
 
     let mut force_token_refresh = false;
-    let mut browser_auth_attempted = false;
     loop {
         let mut url = base_url.clone();
 
@@ -773,20 +594,6 @@ async fn handle_inner_https(
             continue;
         }
 
-        // Browser auth: 401, 403, or redirect to login wall
-        if auth.is_none() && !browser_auth_attempted {
-            let needs_auth =
-                classify_response(upstream.status(), upstream.headers(), &base_url);
-            if let Some(response) =
-                try_browser_auth(&hostname, needs_auth, &state, &mut browser_auth_attempted)
-                    .await
-            {
-                if response {
-                    continue;
-                }
-            }
-        }
-
         let response_status = upstream.status();
         let response_headers = upstream.headers().clone();
         let response_body = match upstream.bytes().await {
@@ -797,11 +604,20 @@ async fn handle_inner_https(
             }
         };
 
-        return Ok(build_response_from_parts(
-            response_status,
-            &response_headers,
-            response_body,
-        ));
+        let mut resp = build_response_from_parts(response_status, &response_headers, response_body);
+
+        // When no auth is configured and upstream says 401/403, hint how to fix it
+        if auth.is_none()
+            && (response_status == reqwest::StatusCode::UNAUTHORIZED
+                || response_status == reqwest::StatusCode::FORBIDDEN)
+        {
+            let hint = auth_hint_command(&hostname);
+            if let Ok(v) = hyper::header::HeaderValue::from_str(&hint) {
+                resp.headers_mut().insert("x-nv-auth-hint", v);
+            }
+        }
+
+        return Ok(resp);
     }
 }
 
@@ -948,4 +764,26 @@ fn extract_host_from_request(req: &Request<Incoming>, uri: &Uri) -> Option<Strin
         .get(hyper::header::HOST)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string)
+}
+
+/// Returns the `nv add` command an agent should run to authenticate with `host`.
+fn auth_hint_command(host: &str) -> String {
+    const DEVICE_FLOW_HOSTS: &[&str] = &[
+        "github.com",
+        "api.github.com",
+        "gitlab.com",
+        "accounts.google.com",
+        "login.microsoftonline.com",
+        "login.live.com",
+    ];
+
+    let uses_device_flow = DEVICE_FLOW_HOSTS
+        .iter()
+        .any(|&h| host == h || host.ends_with(&format!(".{h}")));
+
+    if uses_device_flow {
+        format!("nv add {host} --device-flow")
+    } else {
+        format!("nv add {host} --bearer --browser")
+    }
 }
