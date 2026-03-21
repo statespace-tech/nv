@@ -2,7 +2,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::args::{
-    AddArgs, DaemonArgs, ListArgs, PortArgs, RemoveArgs, RunArgs, StopArgs, TrustArgs, UntrustArgs,
+    AddArgs, BrowseArgs, DaemonArgs, ListArgs, PortArgs, RemoveArgs, RunArgs, StopArgs, TrustArgs,
+    UntrustArgs,
 };
 use crate::error::{Error, Result};
 use crate::proxy::ca::generate_ca;
@@ -359,6 +360,20 @@ pub(crate) fn run_stop(args: &StopArgs) -> Result<()> {
 pub(crate) async fn run_port(args: PortArgs) -> Result<()> {
     let port = ensure_daemon_running(&args.project_dir).await?;
     println!("{port}");
+    Ok(())
+}
+
+pub(crate) async fn run_browse(args: BrowseArgs) -> Result<()> {
+    let project_dir = resolve_project_dir(&args.path)?;
+    validate_project_dir(&project_dir)?;
+
+    let port = ensure_daemon_running(&project_dir).await?;
+
+    crate::proxy::browser::open_with_proxy(&args.url, port)
+        .map_err(|e| Error::cli(format!("Failed to open browser: {e}")))?;
+
+    println!("Browser opened. Log in, then close the window when done.");
+    println!("Session cookies will persist for the lifetime of the proxy.");
     Ok(())
 }
 

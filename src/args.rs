@@ -49,6 +49,9 @@ pub(crate) enum Commands {
     /// Open browser auth window (internal)
     #[command(name = "_auth", hide = true)]
     Auth(AuthArgs),
+
+    /// Open a browser window to establish a session
+    Browse(BrowseArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -166,4 +169,14 @@ pub(crate) struct AuthArgs {
 
     /// Proxy port to route through
     pub proxy_port: u16,
+}
+
+#[derive(Debug, Parser)]
+pub(crate) struct BrowseArgs {
+    /// URL to open
+    pub url: String,
+
+    /// Project directory containing nv.toml (default: current directory)
+    #[arg(long, default_value = ".")]
+    pub path: PathBuf,
 }

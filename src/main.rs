@@ -47,6 +47,7 @@ async fn run() -> Result<()> {
         Commands::Daemon(a) => commands::env::run_daemon_cmd(a).await,
         Commands::Stop(ref a) => commands::env::run_stop(a),
         Commands::Port(a) => commands::env::run_port(a).await,
+        Commands::Browse(a) => commands::env::run_browse(a).await,
         // Handled synchronously in main() before the runtime starts
         Commands::Auth(_) => Ok(()),
     }
