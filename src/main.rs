@@ -3,13 +3,31 @@ mod commands;
 mod error;
 mod proxy;
 
-use args::{Cli, Commands};
+use args::{Cli, Commands, InitArgs};
 use clap::Parser;
 use error::Result;
 
-#[tokio::main]
-async fn main() {
-    if let Err(e) = run().await {
+fn main() {
+    // `_auth` opens a wry window whose event loop must run on the OS main thread —
+    // handle it synchronously before the tokio runtime is created.
+    let raw: Vec<String> = std::env::args().collect();
+    if raw.get(1).map(String::as_str) == Some("_auth") {
+        let cli = Cli::parse();
+        if let Commands::Auth(a) = cli.command {
+            proxy::browser::run_auth_window(&a.url, a.proxy_port);
+        }
+        return;
+    }
+
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("error: failed to create tokio runtime: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(e) = rt.block_on(run()) {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
@@ -19,15 +37,17 @@ async fn run() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        None => commands::env::run_create(&cli.path),
-        Some(Commands::Add(a)) => commands::env::run_add(a),
-        Some(Commands::Remove(ref a)) => commands::env::run_remove(a),
-        Some(Commands::List(ref a)) => commands::env::run_list(a),
-        Some(Commands::Run(a)) => commands::env::run_run(a).await,
-        Some(Commands::Trust(ref a)) => commands::env::run_trust(a),
-        Some(Commands::Untrust(ref a)) => commands::env::run_untrust(a),
-        Some(Commands::Daemon(a)) => commands::env::run_daemon_cmd(a).await,
-        Some(Commands::Stop(ref a)) => commands::env::run_stop(a),
-        Some(Commands::Port(a)) => commands::env::run_port(a).await,
+        Commands::Init(InitArgs { path, name }) => commands::env::run_create(&path, name.as_deref()),
+        Commands::Add(a) => commands::env::run_add(a),
+        Commands::Remove(ref a) => commands::env::run_remove(a),
+        Commands::List(ref a) => commands::env::run_list(a),
+        Commands::Run(a) => commands::env::run_run(a).await,
+        Commands::Trust(ref a) => commands::env::run_trust(a),
+        Commands::Untrust(ref a) => commands::env::run_untrust(a),
+        Commands::Daemon(a) => commands::env::run_daemon_cmd(a).await,
+        Commands::Stop(ref a) => commands::env::run_stop(a),
+        Commands::Port(a) => commands::env::run_port(a).await,
+        // Handled synchronously in main() before the runtime starts
+        Commands::Auth(_) => Ok(()),
     }
 }

@@ -3,20 +3,19 @@ use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
 #[command(name = "nv")]
-#[command(about = "Net environment CLI — a transparent browser for agents.")]
+#[command(about = "NV — a transparent browser for agents.")]
 #[command(version)]
 #[allow(unreachable_pub)]
 pub struct Cli {
     #[command(subcommand)]
-    pub command: Option<Commands>,
-
-    /// Path for the net environment (default: .nv)
-    #[arg(default_value = ".nv", global = false)]
-    pub path: PathBuf,
+    pub command: Commands,
 }
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Commands {
+    /// Initialise a net environment in the current directory
+    Init(InitArgs),
+
     /// Add or update auth for a host (secret stored in OS keychain)
     Add(AddArgs),
 
@@ -46,6 +45,21 @@ pub(crate) enum Commands {
     /// Print the proxy port, starting the daemon if needed (internal)
     #[command(name = "_port", hide = true)]
     Port(PortArgs),
+
+    /// Open browser auth window (internal)
+    #[command(name = "_auth", hide = true)]
+    Auth(AuthArgs),
+}
+
+#[derive(Debug, Parser)]
+pub(crate) struct InitArgs {
+    /// Project directory to initialise (default: current directory)
+    #[arg(default_value = ".")]
+    pub path: PathBuf,
+
+    /// Display name shown in the shell prompt (default: directory name)
+    #[arg(long)]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -77,8 +91,8 @@ pub(crate) struct AddArgs {
     #[arg(long, value_name = "SCOPE")]
     pub scopes: Vec<String>,
 
-    /// Path to env directory (default: .nv)
-    #[arg(long, default_value = ".nv")]
+    /// Project directory containing nv.toml (default: current directory)
+    #[arg(long, default_value = ".")]
     pub path: PathBuf,
 }
 
@@ -87,22 +101,22 @@ pub(crate) struct RemoveArgs {
     /// Hostname to remove
     pub host: String,
 
-    /// Path to env directory (default: .nv)
-    #[arg(long, default_value = ".nv")]
+    /// Project directory containing nv.toml (default: current directory)
+    #[arg(long, default_value = ".")]
     pub path: PathBuf,
 }
 
 #[derive(Debug, Parser)]
 pub(crate) struct ListArgs {
-    /// Path to env directory (default: .nv)
-    #[arg(default_value = ".nv")]
+    /// Project directory containing nv.toml (default: current directory)
+    #[arg(default_value = ".")]
     pub path: PathBuf,
 }
 
 #[derive(Debug, Parser)]
 pub(crate) struct RunArgs {
-    /// Path to env directory (default: .nv)
-    #[arg(long, default_value = ".nv")]
+    /// Project directory containing nv.toml (default: current directory)
+    #[arg(long, default_value = ".")]
     pub path: PathBuf,
 
     /// Command to run
@@ -115,32 +129,41 @@ pub(crate) struct RunArgs {
 
 #[derive(Debug, Parser)]
 pub(crate) struct TrustArgs {
-    /// Path to env directory (default: .nv)
-    #[arg(default_value = ".nv")]
+    /// Project directory containing nv.toml (default: current directory)
+    #[arg(default_value = ".")]
     pub path: PathBuf,
 }
 
 #[derive(Debug, Parser)]
 pub(crate) struct UntrustArgs {
-    /// Path to env directory (default: .nv)
-    #[arg(default_value = ".nv")]
+    /// Project directory containing nv.toml (default: current directory)
+    #[arg(default_value = ".")]
     pub path: PathBuf,
 }
 
 #[derive(Debug, Parser)]
 pub(crate) struct DaemonArgs {
-    /// Absolute path to env directory
-    pub env_dir: PathBuf,
+    /// Absolute path to project directory
+    pub project_dir: PathBuf,
 }
 
 #[derive(Debug, Parser)]
 pub(crate) struct StopArgs {
-    /// Absolute path to env directory
-    pub env_dir: PathBuf,
+    /// Absolute path to project directory
+    pub project_dir: PathBuf,
 }
 
 #[derive(Debug, Parser)]
 pub(crate) struct PortArgs {
-    /// Absolute path to env directory
-    pub env_dir: PathBuf,
+    /// Absolute path to project directory
+    pub project_dir: PathBuf,
+}
+
+#[derive(Debug, Parser)]
+pub(crate) struct AuthArgs {
+    /// URL to open in the browser
+    pub url: String,
+
+    /// Proxy port to route through
+    pub proxy_port: u16,
 }
