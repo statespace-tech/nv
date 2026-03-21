@@ -45,6 +45,10 @@ pub(crate) enum Commands {
     /// Print the proxy port, starting the daemon if needed (internal)
     #[command(name = "_port", hide = true)]
     Port(PortArgs),
+
+    /// Open login window (internal)
+    #[command(name = "_login", hide = true)]
+    Login(LoginArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -64,19 +68,19 @@ pub(crate) struct AddArgs {
     pub host: String,
 
     /// Bearer token auth (secret stored in OS keychain)
-    #[arg(long, conflicts_with_all = ["header", "query", "oauth2", "device_flow"])]
+    #[arg(long, conflicts_with_all = ["header", "query", "oauth2", "device_flow", "login"])]
     pub bearer: bool,
 
     /// Custom header auth — specify the header name
-    #[arg(long, value_name = "NAME", conflicts_with_all = ["bearer", "query", "oauth2", "device_flow"])]
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["bearer", "query", "oauth2", "device_flow", "login"])]
     pub header: Option<String>,
 
     /// Query parameter auth — specify the param name
-    #[arg(long, value_name = "PARAM", conflicts_with_all = ["bearer", "header", "oauth2", "device_flow"])]
+    #[arg(long, value_name = "PARAM", conflicts_with_all = ["bearer", "header", "oauth2", "device_flow", "login"])]
     pub query: Option<String>,
 
     /// OAuth2 client credentials auth
-    #[arg(long, conflicts_with_all = ["bearer", "header", "query", "device_flow"], requires = "token_url")]
+    #[arg(long, conflicts_with_all = ["bearer", "header", "query", "device_flow", "login"], requires = "token_url")]
     pub oauth2: bool,
 
     /// OAuth2 / device flow token endpoint URL
@@ -88,7 +92,7 @@ pub(crate) struct AddArgs {
     pub scopes: Vec<String>,
 
     /// OAuth2 device authorization flow — opens default browser to authorize
-    #[arg(long, conflicts_with_all = ["bearer", "header", "query", "oauth2"])]
+    #[arg(long, conflicts_with_all = ["bearer", "header", "query", "oauth2", "login"])]
     pub device_flow: bool,
 
     /// Device code endpoint URL (inferred for known services, required otherwise)
@@ -102,6 +106,10 @@ pub(crate) struct AddArgs {
     /// Collect the secret via a browser form instead of a terminal prompt
     #[arg(long)]
     pub browser: bool,
+
+    /// Open a login window to authenticate with this host (captures session via proxy)
+    #[arg(long, conflicts_with_all = ["bearer", "header", "query", "oauth2", "device_flow", "browser"])]
+    pub login: bool,
 
     /// Project directory containing nv.toml (default: current directory)
     #[arg(long, default_value = ".")]
@@ -169,4 +177,13 @@ pub(crate) struct StopArgs {
 pub(crate) struct PortArgs {
     /// Absolute path to project directory
     pub project_dir: PathBuf,
+}
+
+#[derive(Debug, Parser)]
+pub(crate) struct LoginArgs {
+    /// URL to open in the login window
+    pub url: String,
+
+    /// Proxy port to route through
+    pub proxy_port: u16,
 }

@@ -357,6 +357,7 @@ pub(crate) fn port_path(project_dir: &Path) -> PathBuf {
 }
 
 /// Path to the agent-readable session list (hostnames + auth timestamps).
+#[allow(dead_code)]
 pub(crate) fn sessions_path(project_dir: &Path) -> PathBuf {
     runtime_dir(project_dir).join("sessions")
 }

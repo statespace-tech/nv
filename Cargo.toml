@@ -36,6 +36,9 @@ notify = "6"
 inquire = "0.7"
 keyring = "3"
 open = "5"
+wry = { version = "0.36", features = ["mac-proxy"] }
+tao = "0.26"
+reqwest_cookie_store = "0.8"
 
 [lints.rust]
 unsafe_code = "forbid"

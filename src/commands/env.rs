@@ -123,6 +123,10 @@ pub(crate) async fn run_add(args: AddArgs) -> Result<()> {
         return run_device_flow(args, &project_dir).await;
     }
 
+    if args.login {
+        return run_login(args, &project_dir).await;
+    }
+
     let auth = if args.bearer || (!args.oauth2 && args.header.is_none() && args.query.is_none()) {
         let secret = if args.browser {
             crate::proxy::browser::collect_via_browser(&args.host, "Paste your API key or token").await?
@@ -181,6 +185,29 @@ pub(crate) async fn run_add(args: AddArgs) -> Result<()> {
     config.save(&project_dir)?;
 
     println!("Auth configured for '{}' (secret stored in keychain).", args.host);
+    Ok(())
+}
+
+async fn run_login(args: AddArgs, project_dir: &std::path::Path) -> Result<()> {
+    let host = &args.host;
+
+    // Ensure daemon is running so we have a proxy port to route through
+    let port = ensure_daemon_running(project_dir).await?;
+
+    // Derive the login URL — use the root of the host
+    let url = format!("https://{host}");
+
+    let mut child = crate::proxy::browser::open_login_window(&url, port)
+        .map_err(|e| Error::cli(format!("Failed to open login window: {e}")))?;
+
+    println!("Sign in to {host}, then close the window.");
+
+    // Wait for the login window process to exit
+    child
+        .wait()
+        .map_err(|e| Error::cli(format!("Login window error: {e}")))?;
+
+    println!("Login window closed. Session cookies saved.");
     Ok(())
 }
 
@@ -455,9 +482,8 @@ fn trust_ca_cert(cert_path: &Path) -> Result<()> {
 
     #[cfg(target_os = "macos")]
     {
-        let status = std::process::Command::new("sudo")
+        let status = std::process::Command::new("security")
             .args([
-                "security",
                 "add-trusted-cert",
                 "-d",
                 "-r",
@@ -472,7 +498,9 @@ fn trust_ca_cert(cert_path: &Path) -> Result<()> {
         if status.success() {
             eprintln!("CA trusted. Run `nv untrust` to remove it.");
         } else {
-            return Err(Error::cli("Failed to install CA certificate."));
+            eprintln!("Failed to install CA certificate.");
+            eprintln!("Try running: sudo nv trust");
+            return Err(Error::cli("Failed to install CA certificate. Try: sudo nv trust"));
         }
     }
 
@@ -503,15 +531,17 @@ pub(crate) fn run_untrust(args: &UntrustArgs) -> Result<()> {
 
     #[cfg(target_os = "macos")]
     {
-        let status = std::process::Command::new("sudo")
-            .args(["security", "remove-trusted-cert", "-d", &cert_str])
+        let status = std::process::Command::new("security")
+            .args(["remove-trusted-cert", "-d", &cert_str])
             .status()
             .map_err(|e| Error::cli(format!("Failed to run security command: {e}")))?;
 
         if status.success() {
             eprintln!("CA removed from system trust store.");
         } else {
-            return Err(Error::cli("Failed to remove CA certificate."));
+            eprintln!("Failed to remove CA certificate.");
+            eprintln!("Try running: sudo nv untrust");
+            return Err(Error::cli("Failed to remove CA certificate. Try: sudo nv untrust"));
         }
     }
 

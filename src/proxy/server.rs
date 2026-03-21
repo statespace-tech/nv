@@ -4,6 +4,7 @@ use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode, Uri};
 use hyper_util::rt::TokioIo;
 use notify::{EventKind, RecursiveMode, Watcher};
+use reqwest_cookie_store::CookieStoreMutex;
 use rustls::ServerConfig;
 use std::net::TcpListener as StdTcpListener;
 use std::sync::Arc;
@@ -133,6 +134,8 @@ struct ProxyState {
     ca: CertificateAuthority,
     client: reqwest::Client,
     oauth_cache: Arc<tokio::sync::Mutex<std::collections::HashMap<String, OAuthToken>>>,
+    cookie_store: Arc<CookieStoreMutex>,
+    project_dir: std::path::PathBuf,
 }
 
 /// Run the proxy daemon. This function does not return until the process exits.
@@ -147,9 +150,18 @@ pub(crate) async fn run_daemon(project_dir: std::path::PathBuf) -> Result<()> {
     let config = Arc::new(RwLock::new(initial_config));
     let ca = crate::proxy::ca::ensure_global_ca()?;
 
+    // Set up cookie store and restore any saved session cookies
+    let cookie_store = Arc::new(CookieStoreMutex::default());
+    let keychain_key = project_dir.to_string_lossy().into_owned();
+    if let Some(json) = crate::proxy::keychain::get("sessions", &keychain_key) {
+        crate::proxy::browser::restore_cookies(&json, &cookie_store);
+    }
+    let cookie_store_for_client = Arc::clone(&cookie_store);
+
     // Build reqwest client
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(false)
+        .cookie_provider(cookie_store_for_client)
         .build()
         .map_err(|e| Error::cli(format!("Failed to build HTTP client: {e}")))?;
 
@@ -169,6 +181,8 @@ pub(crate) async fn run_daemon(project_dir: std::path::PathBuf) -> Result<()> {
         ca,
         client,
         oauth_cache: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        cookie_store,
+        project_dir: project_dir.clone(),
     });
 
     // Watch nv.toml for changes and reload automatically
@@ -222,6 +236,17 @@ pub(crate) async fn run_daemon(project_dir: std::path::PathBuf) -> Result<()> {
             }
         });
     }
+}
+
+/// Persist cookies to keychain after successful login.
+fn persist_session(host: &str, state: &ProxyState) {
+    let keychain_key = state.project_dir.to_string_lossy().into_owned();
+    if let Some(json) = crate::proxy::browser::serialize_cookies(&state.cookie_store) {
+        if let Err(e) = crate::proxy::keychain::store("sessions", &keychain_key, &json) {
+            warn!("Failed to persist session cookies: {e}");
+        }
+    }
+    info!("Session persisted for {host}");
 }
 
 async fn handle_connection(
@@ -372,6 +397,11 @@ async fn handle_http(
                 Bytes::new()
             }
         };
+
+        // Persist cookies whenever the upstream sets new session cookies
+        if response_headers.contains_key(reqwest::header::SET_COOKIE) {
+            persist_session(&host, &state);
+        }
 
         let mut resp = build_response_from_parts(response_status, &response_headers, response_body);
 
@@ -604,6 +634,11 @@ async fn handle_inner_https(
             }
         };
 
+        // Persist cookies whenever the upstream sets new session cookies
+        if response_headers.contains_key(reqwest::header::SET_COOKIE) {
+            persist_session(&hostname, &state);
+        }
+
         let mut resp = build_response_from_parts(response_status, &response_headers, response_body);
 
         // When no auth is configured and upstream says 401/403, hint how to fix it
@@ -768,22 +803,5 @@ fn extract_host_from_request(req: &Request<Incoming>, uri: &Uri) -> Option<Strin
 
 /// Returns the `nv add` command an agent should run to authenticate with `host`.
 fn auth_hint_command(host: &str) -> String {
-    const DEVICE_FLOW_HOSTS: &[&str] = &[
-        "github.com",
-        "api.github.com",
-        "gitlab.com",
-        "accounts.google.com",
-        "login.microsoftonline.com",
-        "login.live.com",
-    ];
-
-    let uses_device_flow = DEVICE_FLOW_HOSTS
-        .iter()
-        .any(|&h| host == h || host.ends_with(&format!(".{h}")));
-
-    if uses_device_flow {
-        format!("nv add {host} --device-flow")
-    } else {
-        format!("nv add {host} --bearer --browser")
-    }
+    format!("nv add {host} --login")
 }
