@@ -18,7 +18,9 @@ use indexmap::IndexMap;
 
 use crate::error::{Error, Result};
 use crate::proxy::ca::{CertificateAuthority, generate_host_cert};
-use crate::proxy::config::{AuthConfig, EnvConfig, config_path, pid_path, port_path, runtime_dir};
+use crate::proxy::config::{
+    AuthConfig, EnvConfig, config_path, pid_path, port_path, runtime_dir, sessions_path,
+};
 
 /// Hop-by-hop headers that must not be forwarded.
 const HOP_BY_HOP: &[&str] = &[
@@ -137,8 +139,8 @@ struct ProxyState {
     cookie_store: Arc<CookieStoreMutex>,
     /// The port this daemon is listening on (passed to browser auth windows).
     port: u16,
-    /// Runtime directory for this project (`.nv/`).
-    runtime_dir: std::path::PathBuf,
+    /// Project directory (used for sessions file and keychain key).
+    project_dir: std::path::PathBuf,
     /// Hosts for which a browser auth window is currently open.
     browser_auth_in_progress: Arc<tokio::sync::Mutex<HashSet<String>>>,
 }
@@ -155,13 +157,29 @@ pub(crate) async fn run_daemon(project_dir: std::path::PathBuf) -> Result<()> {
     let config = Arc::new(RwLock::new(initial_config));
     let ca = crate::proxy::ca::ensure_global_ca()?;
 
-    // Inspectable cookie jar shared between the reqwest client and the browser
-    // auth poller — lets us detect when the user has logged in.
+    // Inspectable cookie jar — restore from keychain if available
     let cookie_store = Arc::new(CookieStoreMutex::default());
+    let keychain_key = project_dir.to_string_lossy().into_owned();
+    if let Some(json) = crate::proxy::keychain::get("sessions", &keychain_key) {
+        crate::proxy::browser::restore_cookies(&json, &cookie_store);
+    }
 
+    // Build reqwest client with:
+    //  - custom redirect policy that stops at login-wall redirects
+    //  - shared inspectable cookie jar
+    let cookie_store_for_client = Arc::clone(&cookie_store);
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(false)
-        .cookie_provider(Arc::clone(&cookie_store))
+        .cookie_provider(cookie_store_for_client)
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if crate::proxy::browser::is_login_redirect(attempt.url()) {
+                attempt.stop()
+            } else if attempt.previous().len() > 10 {
+                attempt.error("too many redirects")
+            } else {
+                attempt.follow()
+            }
+        }))
         .build()
         .map_err(|e| Error::cli(format!("Failed to build HTTP client: {e}")))?;
 
@@ -183,7 +201,7 @@ pub(crate) async fn run_daemon(project_dir: std::path::PathBuf) -> Result<()> {
         oauth_cache: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         cookie_store,
         port,
-        runtime_dir: rt_dir,
+        project_dir: project_dir.clone(),
         browser_auth_in_progress: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
     });
 
@@ -257,6 +275,81 @@ async fn wait_for_browser_auth(
     false
 }
 
+/// Persist the cookie jar to the OS keychain and update the agent-readable
+/// sessions file in `.nv/sessions`.
+fn persist_session(host: &str, state: &ProxyState) {
+    // Save cookie jar to keychain
+    let keychain_key = state.project_dir.to_string_lossy().into_owned();
+    if let Some(json) = crate::proxy::browser::serialize_cookies(&state.cookie_store) {
+        if let Err(e) = crate::proxy::keychain::store("sessions", &keychain_key, &json) {
+            warn!("Failed to persist session cookies to keychain: {e}");
+        }
+    }
+
+    // Update .nv/sessions — agent-readable list of authenticated hosts
+    let sessions_file = sessions_path(&state.project_dir);
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    // Read existing sessions, add/update this host
+    let mut sessions: serde_json::Map<String, serde_json::Value> =
+        std::fs::read_to_string(&sessions_file)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+
+    sessions.insert(
+        host.to_string(),
+        serde_json::json!({ "authenticated_at": timestamp }),
+    );
+
+    if let Ok(json) = serde_json::to_string_pretty(&serde_json::Value::Object(sessions)) {
+        if let Err(e) = std::fs::write(&sessions_file, json) {
+            warn!("Failed to write sessions file: {e}");
+        }
+    }
+
+    info!("Session persisted for {host}");
+}
+
+/// Classify whether a response requires browser authentication.
+enum AuthNeeded {
+    /// No auth required.
+    No,
+    /// 401/403 — open the host's root login page.
+    ApiAuth,
+    /// Redirect to a login wall — open that URL directly.
+    LoginRedirect(String),
+}
+
+fn classify_response(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    base_url: &reqwest::Url,
+) -> AuthNeeded {
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return AuthNeeded::ApiAuth;
+    }
+
+    if status.is_redirection() {
+        if let Some(location) = headers.get(reqwest::header::LOCATION) {
+            if let Ok(loc_str) = location.to_str() {
+                let resolved = reqwest::Url::parse(loc_str)
+                    .or_else(|_| base_url.join(loc_str));
+                if let Ok(loc_url) = resolved {
+                    if crate::proxy::browser::is_login_redirect(&loc_url) {
+                        return AuthNeeded::LoginRedirect(loc_url.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    AuthNeeded::No
+}
+
 async fn handle_connection(
     stream: TcpStream,
     state: Arc<ProxyState>,
@@ -281,7 +374,6 @@ async fn handle_connection(
     Ok(())
 }
 
-/// The main request handler. Returns `Infallible` so errors become HTTP error responses.
 async fn handle_request(
     req: Request<Incoming>,
     state: Arc<ProxyState>,
@@ -335,7 +427,6 @@ async fn handle_http(
         }
     };
 
-    // Extract headers before consuming req
     let incoming_headers: Vec<(String, Vec<u8>)> = req
         .headers()
         .iter()
@@ -343,7 +434,6 @@ async fn handle_http(
         .map(|(n, v)| (n.as_str().to_owned(), v.as_bytes().to_owned()))
         .collect();
 
-    // Collect body (consumes req)
     let body_bytes = match req.collect().await {
         Ok(b) => b.to_bytes(),
         Err(e) => {
@@ -373,62 +463,9 @@ async fn handle_http(
             builder = builder.header(name.as_str(), value.as_bytes());
         }
 
-        match &auth {
-            Some(AuthConfig::Bearer { token: Some(token) }) => {
-                builder = builder.header("Authorization", format!("Bearer {token}"));
-            }
-            Some(AuthConfig::Bearer { token: None }) => {
-                return error_response(
-                    StatusCode::UNAUTHORIZED,
-                    &format!("No secret for '{host}' — run `nv add`"),
-                );
-            }
-            Some(AuthConfig::Header { name, value: Some(value) }) => {
-                builder = builder.header(name.as_str(), value.as_bytes());
-            }
-            Some(AuthConfig::Header { value: None, .. }) => {
-                return error_response(
-                    StatusCode::UNAUTHORIZED,
-                    &format!("No secret for '{host}' — run `nv add`"),
-                );
-            }
-            Some(AuthConfig::Query { .. }) => {}
-            Some(AuthConfig::OAuth2 {
-                client_id: Some(cid),
-                client_secret: Some(cs),
-                token_url,
-                scopes,
-            }) => {
-                match get_cached_oauth_token(
-                    &host,
-                    cid,
-                    cs,
-                    token_url,
-                    scopes,
-                    &state.client,
-                    &state.oauth_cache,
-                    force_token_refresh,
-                )
-                .await
-                {
-                    Ok(token) => {
-                        builder = builder.header("Authorization", format!("Bearer {token}"));
-                    }
-                    Err(e) => {
-                        return error_response(
-                            StatusCode::UNAUTHORIZED,
-                            &format!("OAuth2 error: {e}"),
-                        )
-                    }
-                }
-            }
-            Some(AuthConfig::OAuth2 { .. }) => {
-                return error_response(
-                    StatusCode::UNAUTHORIZED,
-                    &format!("No OAuth2 credentials for '{host}' — run `nv add`"),
-                );
-            }
-            None => {}
+        builder = inject_auth(builder, &auth, &host, &state, force_token_refresh).await;
+        if let Err(e) = check_auth_config(&auth, &host) {
+            return e;
         }
 
         if let Some(secs) = timeout {
@@ -443,7 +480,7 @@ async fn handle_http(
             }
         };
 
-        // On 401 with OAuth2, evict the cached token and retry once with a fresh one.
+        // OAuth2: evict cached token and retry once on 401
         if upstream.status() == reqwest::StatusCode::UNAUTHORIZED
             && matches!(auth, Some(AuthConfig::OAuth2 { .. }))
             && !force_token_refresh
@@ -453,43 +490,17 @@ async fn handle_http(
             continue;
         }
 
-        // On 401 with no configured auth, open a browser window through the proxy
-        // so the user can log in interactively.  Cookies are captured via MITM.
-        if upstream.status() == reqwest::StatusCode::UNAUTHORIZED
-            && auth.is_none()
-            && !browser_auth_attempted
-        {
-            let auth_url = crate::proxy::browser::auth_url_for_host(&host);
-            let mut in_progress = state.browser_auth_in_progress.lock().await;
-            if !in_progress.contains(&host) {
-                in_progress.insert(host.clone());
-                drop(in_progress);
-                match crate::proxy::browser::open_with_proxy(
-                    &auth_url,
-                    state.port,
-                    &state.runtime_dir,
-                ) {
-                    Ok(mut child) => {
-                        info!("Waiting for browser auth for {host}…");
-                        let got_cookies =
-                            wait_for_browser_auth(&host, &state.cookie_store, 300).await;
-                        let _ = child.kill();
-                        if got_cookies {
-                            info!("Browser auth complete for {host}");
-                        } else {
-                            warn!("Browser auth timed out for {host}");
-                        }
-                    }
-                    Err(e) => warn!("Failed to open browser auth window: {e}"),
+        // Browser auth: 401, 403, or redirect to login wall
+        if auth.is_none() && !browser_auth_attempted {
+            let needs_auth =
+                classify_response(upstream.status(), upstream.headers(), &base_url);
+            if let Some(response) =
+                try_browser_auth(&host, needs_auth, &state, &mut browser_auth_attempted).await
+            {
+                if response {
+                    continue;
                 }
-                state.browser_auth_in_progress.lock().await.remove(&host);
-            } else {
-                drop(in_progress);
-                // Another concurrent request already opened the window; wait for it.
-                let _got = wait_for_browser_auth(&host, &state.cookie_store, 300).await;
             }
-            browser_auth_attempted = true;
-            continue;
         }
 
         let response_status = upstream.status();
@@ -504,6 +515,57 @@ async fn handle_http(
 
         return build_response_from_parts(response_status, &response_headers, response_body);
     }
+}
+
+/// Attempt browser auth if needed. Returns `Some(true)` to retry the request,
+/// `Some(false)` to continue without retry, `None` if no auth was needed.
+async fn try_browser_auth(
+    host: &str,
+    needs_auth: AuthNeeded,
+    state: &ProxyState,
+    browser_auth_attempted: &mut bool,
+) -> Option<bool> {
+    let open_url = match needs_auth {
+        AuthNeeded::No => return None,
+        AuthNeeded::ApiAuth => crate::proxy::browser::auth_url(host, None),
+        AuthNeeded::LoginRedirect(ref url) => url.clone(),
+    };
+
+    let mut in_progress = state.browser_auth_in_progress.lock().await;
+    if !in_progress.contains(host) {
+        in_progress.insert(host.to_string());
+        drop(in_progress);
+
+        match crate::proxy::browser::open_with_proxy(&open_url, state.port) {
+            Ok(mut child) => {
+                info!("Browser auth required for {host} — opening {open_url}");
+                eprintln!("nv: authentication required for {host} — browser window opened.");
+                let got_cookies =
+                    wait_for_browser_auth(host, &state.cookie_store, 300).await;
+                let _ = child.kill();
+                if got_cookies {
+                    info!("Browser auth complete for {host}");
+                    eprintln!("nv: authenticated ✓ {host}");
+                    persist_session(host, state);
+                    *browser_auth_attempted = true;
+                    state.browser_auth_in_progress.lock().await.remove(host);
+                    return Some(true);
+                }
+                warn!("Browser auth timed out or cancelled for {host}");
+                eprintln!("nv: authentication cancelled or timed out for {host}");
+            }
+            Err(e) => warn!("Failed to open browser auth window: {e}"),
+        }
+
+        state.browser_auth_in_progress.lock().await.remove(host);
+    } else {
+        drop(in_progress);
+        // Another concurrent request already opened the window; wait for it
+        let _got = wait_for_browser_auth(host, &state.cookie_store, 300).await;
+    }
+
+    *browser_auth_attempted = true;
+    Some(false)
 }
 
 /// Handle a CONNECT tunnel request (HTTPS MITM).
@@ -549,7 +611,6 @@ fn handle_connect(
     response
 }
 
-/// Perform TLS MITM for a CONNECT-tunneled connection.
 async fn mitm_tls(
     upgraded: hyper::upgrade::Upgraded,
     hostname: String,
@@ -595,7 +656,6 @@ async fn mitm_tls(
     Ok(())
 }
 
-/// Handle an inner (post-MITM) HTTPS request.
 async fn handle_inner_https(
     req: Request<Incoming>,
     state: Arc<ProxyState>,
@@ -647,7 +707,6 @@ async fn handle_inner_https(
         }
     };
 
-    // Extract headers before consuming req
     let incoming_headers: Vec<(String, Vec<u8>)> = req
         .headers()
         .iter()
@@ -655,7 +714,6 @@ async fn handle_inner_https(
         .map(|(n, v)| (n.as_str().to_owned(), v.as_bytes().to_owned()))
         .collect();
 
-    // Collect body (consumes req)
     let body_bytes = match req.collect().await {
         Ok(b) => b.to_bytes(),
         Err(e) => {
@@ -685,62 +743,9 @@ async fn handle_inner_https(
             builder = builder.header(name.as_str(), value.as_bytes());
         }
 
-        match &auth {
-            Some(AuthConfig::Bearer { token: Some(token) }) => {
-                builder = builder.header("Authorization", format!("Bearer {token}"));
-            }
-            Some(AuthConfig::Bearer { token: None }) => {
-                return Ok(error_response(
-                    StatusCode::UNAUTHORIZED,
-                    &format!("No secret for '{hostname}' — run `nv add`"),
-                ));
-            }
-            Some(AuthConfig::Header { name, value: Some(value) }) => {
-                builder = builder.header(name.as_str(), value.as_bytes());
-            }
-            Some(AuthConfig::Header { value: None, .. }) => {
-                return Ok(error_response(
-                    StatusCode::UNAUTHORIZED,
-                    &format!("No secret for '{hostname}' — run `nv add`"),
-                ));
-            }
-            Some(AuthConfig::Query { .. }) => {}
-            Some(AuthConfig::OAuth2 {
-                client_id: Some(cid),
-                client_secret: Some(cs),
-                token_url,
-                scopes,
-            }) => {
-                match get_cached_oauth_token(
-                    &hostname,
-                    cid,
-                    cs,
-                    token_url,
-                    scopes,
-                    &state.client,
-                    &state.oauth_cache,
-                    force_token_refresh,
-                )
-                .await
-                {
-                    Ok(token) => {
-                        builder = builder.header("Authorization", format!("Bearer {token}"));
-                    }
-                    Err(e) => {
-                        return Ok(error_response(
-                            StatusCode::UNAUTHORIZED,
-                            &format!("OAuth2 error: {e}"),
-                        ))
-                    }
-                }
-            }
-            Some(AuthConfig::OAuth2 { .. }) => {
-                return Ok(error_response(
-                    StatusCode::UNAUTHORIZED,
-                    &format!("No OAuth2 credentials for '{hostname}' — run `nv add`"),
-                ));
-            }
-            None => {}
+        builder = inject_auth(builder, &auth, &hostname, &state, force_token_refresh).await;
+        if let Err(e) = check_auth_config(&auth, &hostname) {
+            return Ok(e);
         }
 
         if let Some(secs) = timeout {
@@ -758,7 +763,7 @@ async fn handle_inner_https(
             }
         };
 
-        // On 401 with OAuth2, evict the cached token and retry once with a fresh one.
+        // OAuth2: evict cached token and retry once on 401
         if upstream.status() == reqwest::StatusCode::UNAUTHORIZED
             && matches!(auth, Some(AuthConfig::OAuth2 { .. }))
             && !force_token_refresh
@@ -768,42 +773,18 @@ async fn handle_inner_https(
             continue;
         }
 
-        // On 401 with no configured auth, open a browser window through the proxy
-        // so the user can log in interactively.  Cookies are captured via MITM.
-        if upstream.status() == reqwest::StatusCode::UNAUTHORIZED
-            && auth.is_none()
-            && !browser_auth_attempted
-        {
-            let auth_url = crate::proxy::browser::auth_url_for_host(&hostname);
-            let mut in_progress = state.browser_auth_in_progress.lock().await;
-            if !in_progress.contains(&hostname) {
-                in_progress.insert(hostname.clone());
-                drop(in_progress);
-                match crate::proxy::browser::open_with_proxy(
-                    &auth_url,
-                    state.port,
-                    &state.runtime_dir,
-                ) {
-                    Ok(mut child) => {
-                        info!("Waiting for browser auth for {hostname}…");
-                        let got_cookies =
-                            wait_for_browser_auth(&hostname, &state.cookie_store, 300).await;
-                        let _ = child.kill();
-                        if got_cookies {
-                            info!("Browser auth complete for {hostname}");
-                        } else {
-                            warn!("Browser auth timed out for {hostname}");
-                        }
-                    }
-                    Err(e) => warn!("Failed to open browser auth window: {e}"),
+        // Browser auth: 401, 403, or redirect to login wall
+        if auth.is_none() && !browser_auth_attempted {
+            let needs_auth =
+                classify_response(upstream.status(), upstream.headers(), &base_url);
+            if let Some(response) =
+                try_browser_auth(&hostname, needs_auth, &state, &mut browser_auth_attempted)
+                    .await
+            {
+                if response {
+                    continue;
                 }
-                state.browser_auth_in_progress.lock().await.remove(&hostname);
-            } else {
-                drop(in_progress);
-                let _got = wait_for_browser_auth(&hostname, &state.cookie_store, 300).await;
             }
-            browser_auth_attempted = true;
-            continue;
         }
 
         let response_status = upstream.status();
@@ -824,7 +805,76 @@ async fn handle_inner_https(
     }
 }
 
-/// Merge configured key/value pairs into the named top-level fields of a JSON body.
+// ── Auth helpers ──────────────────────────────────────────────────────────────
+
+/// Inject authentication headers/params into the request builder.
+/// Returns the (possibly modified) builder.
+async fn inject_auth(
+    mut builder: reqwest::RequestBuilder,
+    auth: &Option<AuthConfig>,
+    host: &str,
+    state: &ProxyState,
+    force_token_refresh: bool,
+) -> reqwest::RequestBuilder {
+    match auth {
+        Some(AuthConfig::Bearer { token: Some(token) }) => {
+            builder = builder.header("Authorization", format!("Bearer {token}"));
+        }
+        Some(AuthConfig::Header { name, value: Some(value) }) => {
+            builder = builder.header(name.as_str(), value.as_bytes());
+        }
+        Some(AuthConfig::OAuth2 {
+            client_id: Some(cid),
+            client_secret: Some(cs),
+            token_url,
+            scopes,
+        }) => {
+            if let Ok(token) = get_cached_oauth_token(
+                host,
+                cid,
+                cs,
+                token_url,
+                scopes,
+                &state.client,
+                &state.oauth_cache,
+                force_token_refresh,
+            )
+            .await
+            {
+                builder = builder.header("Authorization", format!("Bearer {token}"));
+            }
+        }
+        _ => {}
+    }
+    builder
+}
+
+/// Check auth config for missing secrets. Returns `Err(response)` if the
+/// request should be aborted.
+fn check_auth_config(
+    auth: &Option<AuthConfig>,
+    host: &str,
+) -> std::result::Result<(), Response<BoxBody<Bytes, hyper::Error>>> {
+    match auth {
+        Some(AuthConfig::Bearer { token: None }) => Err(error_response(
+            StatusCode::UNAUTHORIZED,
+            &format!("No secret for '{host}' — run `nv add`"),
+        )),
+        Some(AuthConfig::Header { value: None, .. }) => Err(error_response(
+            StatusCode::UNAUTHORIZED,
+            &format!("No secret for '{host}' — run `nv add`"),
+        )),
+        Some(AuthConfig::OAuth2 { client_id: None, .. })
+        | Some(AuthConfig::OAuth2 { client_secret: None, .. }) => Err(error_response(
+            StatusCode::UNAUTHORIZED,
+            &format!("No OAuth2 credentials for '{host}' — run `nv add`"),
+        )),
+        _ => Ok(()),
+    }
+}
+
+// ── Body injection ────────────────────────────────────────────────────────────
+
 fn inject_into_body(
     body_bytes: Bytes,
     inject: &IndexMap<String, IndexMap<String, String>>,
@@ -852,6 +902,8 @@ fn inject_into_body(
         .map(Bytes::from)
         .unwrap_or(body_bytes)
 }
+
+// ── Response helpers ──────────────────────────────────────────────────────────
 
 fn build_response_from_parts(
     status: reqwest::StatusCode,
