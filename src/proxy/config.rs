@@ -39,9 +39,13 @@ pub(crate) enum AuthConfig {
     },
 }
 
-/// Top-level `config.toml` structure.
+/// Top-level `nv.toml` structure.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub(crate) struct EnvConfig {
+    /// Display name shown in the shell prompt (e.g. `[myproject]`).
+    /// Defaults to the project directory's basename.
+    pub name: Option<String>,
+
     #[serde(default)]
     pub proxy: ProxyConfig,
 
@@ -326,8 +330,14 @@ fn strip_port(host: &str) -> &str {
     host.split(':').next().unwrap_or(host)
 }
 
-pub(crate) fn config_path(env_dir: &Path) -> PathBuf {
-    env_dir.join("config.toml")
+/// Path to the project-level config file (committed).
+pub(crate) fn config_path(project_dir: &Path) -> PathBuf {
+    project_dir.join("nv.toml")
+}
+
+/// Path to the runtime directory (gitignored, holds pid/port/activate).
+pub(crate) fn runtime_dir(project_dir: &Path) -> PathBuf {
+    project_dir.join(".nv")
 }
 
 pub(crate) fn ca_cert_path(env_dir: &Path) -> PathBuf {
@@ -338,19 +348,19 @@ pub(crate) fn ca_key_path(env_dir: &Path) -> PathBuf {
     env_dir.join("ca.key")
 }
 
-pub(crate) fn pid_path(env_dir: &Path) -> PathBuf {
-    env_dir.join("proxy.pid")
+pub(crate) fn pid_path(project_dir: &Path) -> PathBuf {
+    runtime_dir(project_dir).join("proxy.pid")
 }
 
-pub(crate) fn port_path(env_dir: &Path) -> PathBuf {
-    env_dir.join("proxy.port")
+pub(crate) fn port_path(project_dir: &Path) -> PathBuf {
+    runtime_dir(project_dir).join("proxy.port")
 }
 
-pub(crate) fn validate_env_dir(env_dir: &Path) -> Result<()> {
-    if !env_dir.is_dir() {
+pub(crate) fn validate_project_dir(project_dir: &Path) -> Result<()> {
+    if !config_path(project_dir).exists() {
         return Err(Error::cli(format!(
-            "Net environment '{}' does not exist. Run `nv` first.",
-            env_dir.display()
+            "No nv.toml found in '{}'. Run `nv` first.",
+            project_dir.display()
         )));
     }
     Ok(())
@@ -368,7 +378,7 @@ pub(crate) fn global_ca_cert_path() -> Option<PathBuf> {
 
 /// Default config template written on env creation.
 pub(crate) fn default_config_template() -> &'static str {
-    r#"# nv — net environment configuration
+    r#"# nv.toml — net environment configuration
 #
 # Host patterns:
 #   exact host:       "api.example.com"
