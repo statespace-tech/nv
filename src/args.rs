@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
 #[command(name = "nv")]
-#[command(about = "NV — a transparent browser for agents.")]
+#[command(about = "nv — a transparent HTTPS proxy for agents.")]
 #[command(version)]
 #[allow(unreachable_pub)]
 pub struct Cli {
@@ -16,7 +16,7 @@ pub(crate) enum Commands {
     /// Initialise a net environment in the current directory
     Init(InitArgs),
 
-    /// Add or update auth for a host (secret stored in OS keychain)
+    /// Add or update auth for a host (secret stored in .nv/secrets.enc)
     Add(AddArgs),
 
     /// Remove a host rule
@@ -46,9 +46,11 @@ pub(crate) enum Commands {
     #[command(name = "_port", hide = true)]
     Port(PortArgs),
 
-    /// Open login window (internal)
-    #[command(name = "_login", hide = true)]
-    Login(LoginArgs),
+    /// Manage the project encryption key
+    Key(KeyArgs),
+
+    /// Start a shell with the net environment active
+    Activate(ActivateArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -67,20 +69,20 @@ pub(crate) struct AddArgs {
     /// Hostname to match (e.g. api.example.com)
     pub host: String,
 
-    /// Bearer token auth (secret stored in OS keychain)
-    #[arg(long, conflicts_with_all = ["header", "query", "oauth2", "device_flow", "login"])]
+    /// Bearer token auth
+    #[arg(long, conflicts_with_all = ["header", "query", "oauth2", "device_flow"])]
     pub bearer: bool,
 
     /// Custom header auth — specify the header name
-    #[arg(long, value_name = "NAME", conflicts_with_all = ["bearer", "query", "oauth2", "device_flow", "login"])]
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["bearer", "query", "oauth2", "device_flow"])]
     pub header: Option<String>,
 
     /// Query parameter auth — specify the param name
-    #[arg(long, value_name = "PARAM", conflicts_with_all = ["bearer", "header", "oauth2", "device_flow", "login"])]
+    #[arg(long, value_name = "PARAM", conflicts_with_all = ["bearer", "header", "oauth2", "device_flow"])]
     pub query: Option<String>,
 
     /// OAuth2 client credentials auth
-    #[arg(long, conflicts_with_all = ["bearer", "header", "query", "device_flow", "login"], requires = "token_url")]
+    #[arg(long, conflicts_with_all = ["bearer", "header", "query", "device_flow"], requires = "token_url")]
     pub oauth2: bool,
 
     /// OAuth2 / device flow token endpoint URL
@@ -92,7 +94,7 @@ pub(crate) struct AddArgs {
     pub scopes: Vec<String>,
 
     /// OAuth2 device authorization flow — opens default browser to authorize
-    #[arg(long, conflicts_with_all = ["bearer", "header", "query", "oauth2", "login"])]
+    #[arg(long, conflicts_with_all = ["bearer", "header", "query", "oauth2"])]
     pub device_flow: bool,
 
     /// Device code endpoint URL (inferred for known services, required otherwise)
@@ -106,10 +108,6 @@ pub(crate) struct AddArgs {
     /// Collect the secret via a browser form instead of a terminal prompt
     #[arg(long)]
     pub browser: bool,
-
-    /// Open a login window to authenticate with this host (captures session via proxy)
-    #[arg(long, conflicts_with_all = ["bearer", "header", "query", "oauth2", "device_flow", "browser"])]
-    pub login: bool,
 
     /// Project directory containing nv.toml (default: current directory)
     #[arg(long, default_value = ".")]
@@ -180,10 +178,38 @@ pub(crate) struct PortArgs {
 }
 
 #[derive(Debug, Parser)]
-pub(crate) struct LoginArgs {
-    /// URL to open in the login window
-    pub url: String,
+pub(crate) struct KeyArgs {
+    #[command(subcommand)]
+    pub command: KeyCommands,
+}
 
-    /// Proxy port to route through
-    pub proxy_port: u16,
+#[derive(Debug, Subcommand)]
+pub(crate) enum KeyCommands {
+    /// Print the base64-encoded project key (for CI or transferring to another machine)
+    Export(KeyExportArgs),
+    /// Import a base64-encoded project key onto this machine
+    Import(KeyImportArgs),
+}
+
+#[derive(Debug, Parser)]
+pub(crate) struct ActivateArgs {
+    /// Project directory containing nv.toml (default: current directory)
+    #[arg(long, default_value = ".")]
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Parser)]
+pub(crate) struct KeyExportArgs {
+    /// Project directory containing nv.toml (default: current directory)
+    #[arg(long, default_value = ".")]
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Parser)]
+pub(crate) struct KeyImportArgs {
+    /// Base64-encoded 32-byte key (output of `nv key export`)
+    pub key: String,
+    /// Project directory containing nv.toml (default: current directory)
+    #[arg(long, default_value = ".")]
+    pub path: PathBuf,
 }

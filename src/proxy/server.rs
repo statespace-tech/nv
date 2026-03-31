@@ -4,7 +4,6 @@ use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode, Uri};
 use hyper_util::rt::TokioIo;
 use notify::{EventKind, RecursiveMode, Watcher};
-use reqwest_cookie_store::CookieStoreMutex;
 use rustls::ServerConfig;
 use std::net::TcpListener as StdTcpListener;
 use std::sync::Arc;
@@ -18,8 +17,9 @@ use indexmap::IndexMap;
 use crate::error::{Error, Result};
 use crate::proxy::ca::{CertificateAuthority, generate_host_cert};
 use crate::proxy::config::{
-    AuthConfig, EnvConfig, config_path, pid_path, port_path, runtime_dir,
+    AuthConfig, EnvConfig, config_path, pid_path, port_path, runtime_dir, secrets_path,
 };
+use crate::proxy::secrets::SecretsStore;
 
 /// Hop-by-hop headers that must not be forwarded.
 const HOP_BY_HOP: &[&str] = &[
@@ -134,8 +134,17 @@ struct ProxyState {
     ca: CertificateAuthority,
     client: reqwest::Client,
     oauth_cache: Arc<tokio::sync::Mutex<std::collections::HashMap<String, OAuthToken>>>,
-    cookie_store: Arc<CookieStoreMutex>,
-    project_dir: std::path::PathBuf,
+}
+
+fn load_config_with_secrets(
+    project_dir: &std::path::Path,
+    key: &[u8; 32],
+    sp: &std::path::Path,
+) -> Result<EnvConfig> {
+    let mut config = EnvConfig::load(project_dir)?;
+    let secrets = SecretsStore::load(sp, key)?;
+    config.resolve_secrets(&secrets);
+    Ok(config)
 }
 
 /// Run the proxy daemon. This function does not return until the process exits.
@@ -144,24 +153,21 @@ pub(crate) async fn run_daemon(project_dir: std::path::PathBuf) -> Result<()> {
     let rt_dir = runtime_dir(&project_dir);
     std::fs::create_dir_all(&rt_dir)?;
 
-    // Load config and CA
+    // Load config, decrypt secrets, and resolve
     let mut initial_config = EnvConfig::load(&project_dir)?;
-    initial_config.resolve_secrets();
+    let project_id = initial_config.id.clone().ok_or_else(|| {
+        Error::cli("nv.toml is missing 'id'. Run `nv init` to reinitialise.")
+    })?;
+    let key = crate::proxy::secrets::load_key(&project_id)?;
+    let sp = secrets_path(&project_dir);
+    let initial_secrets = SecretsStore::load(&sp, &key)?;
+    initial_config.resolve_secrets(&initial_secrets);
     let config = Arc::new(RwLock::new(initial_config));
     let ca = crate::proxy::ca::ensure_global_ca()?;
-
-    // Set up cookie store and restore any saved session cookies
-    let cookie_store = Arc::new(CookieStoreMutex::default());
-    let keychain_key = project_dir.to_string_lossy().into_owned();
-    if let Some(json) = crate::proxy::keychain::get("sessions", &keychain_key) {
-        crate::proxy::browser::restore_cookies(&json, &cookie_store);
-    }
-    let cookie_store_for_client = Arc::clone(&cookie_store);
 
     // Build reqwest client
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(false)
-        .cookie_provider(cookie_store_for_client)
         .build()
         .map_err(|e| Error::cli(format!("Failed to build HTTP client: {e}")))?;
 
@@ -181,8 +187,6 @@ pub(crate) async fn run_daemon(project_dir: std::path::PathBuf) -> Result<()> {
         ca,
         client,
         oauth_cache: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        cookie_store,
-        project_dir: project_dir.clone(),
     });
 
     // Watch nv.toml for changes and reload automatically
@@ -200,17 +204,20 @@ pub(crate) async fn run_daemon(project_dir: std::path::PathBuf) -> Result<()> {
     watcher
         .watch(&nv_toml, RecursiveMode::NonRecursive)
         .map_err(|e| Error::cli(format!("Failed to watch nv.toml: {e}")))?;
+    // Also watch .nv/ so secrets.enc changes are picked up immediately
+    let rt_dir = runtime_dir(&project_dir);
+    let _ = watcher.watch(&rt_dir, RecursiveMode::NonRecursive);
 
     let config_for_watcher = Arc::clone(&config);
     let project_dir_for_watcher = project_dir.clone();
+    let sp_for_watcher = sp.clone();
     tokio::spawn(async move {
         let _watcher = watcher;
         while rx.recv().await.is_some() {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             while rx.try_recv().is_ok() {}
-            match EnvConfig::load(&project_dir_for_watcher) {
-                Ok(mut new_config) => {
-                    new_config.resolve_secrets();
+            match load_config_with_secrets(&project_dir_for_watcher, &key, &sp_for_watcher) {
+                Ok(new_config) => {
                     *config_for_watcher.write().await = new_config;
                     info!("config reloaded");
                 }
@@ -238,16 +245,6 @@ pub(crate) async fn run_daemon(project_dir: std::path::PathBuf) -> Result<()> {
     }
 }
 
-/// Persist cookies to keychain after successful login.
-fn persist_session(host: &str, state: &ProxyState) {
-    let keychain_key = state.project_dir.to_string_lossy().into_owned();
-    if let Some(json) = crate::proxy::browser::serialize_cookies(&state.cookie_store) {
-        if let Err(e) = crate::proxy::keychain::store("sessions", &keychain_key, &json) {
-            warn!("Failed to persist session cookies: {e}");
-        }
-    }
-    info!("Session persisted for {host}");
-}
 
 async fn handle_connection(
     stream: TcpStream,
@@ -397,11 +394,6 @@ async fn handle_http(
                 Bytes::new()
             }
         };
-
-        // Persist cookies whenever the upstream sets new session cookies
-        if response_headers.contains_key(reqwest::header::SET_COOKIE) {
-            persist_session(&host, &state);
-        }
 
         let mut resp = build_response_from_parts(response_status, &response_headers, response_body);
 
@@ -634,11 +626,6 @@ async fn handle_inner_https(
             }
         };
 
-        // Persist cookies whenever the upstream sets new session cookies
-        if response_headers.contains_key(reqwest::header::SET_COOKIE) {
-            persist_session(&hostname, &state);
-        }
-
         let mut resp = build_response_from_parts(response_status, &response_headers, response_body);
 
         // When no auth is configured and upstream says 401/403, hint how to fix it
@@ -803,5 +790,5 @@ fn extract_host_from_request(req: &Request<Incoming>, uri: &Uri) -> Option<Strin
 
 /// Returns the `nv add` command an agent should run to authenticate with `host`.
 fn auth_hint_command(host: &str) -> String {
-    format!("nv add {host} --login")
+    format!("nv add {host} --bearer")
 }

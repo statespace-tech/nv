@@ -42,6 +42,10 @@ pub(crate) enum AuthConfig {
 /// Top-level `nv.toml` structure.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub(crate) struct EnvConfig {
+    /// Stable project identifier, generated once by `nv init`.
+    /// Used to locate the project key in `~/.config/nv/keys/<id>`.
+    pub id: Option<String>,
+
     /// Display name shown in the shell prompt (e.g. `[myproject]`).
     /// Defaults to the project directory's basename.
     pub name: Option<String>,
@@ -146,33 +150,32 @@ impl EnvConfig {
         Ok(())
     }
 
-    /// Fill in any `None` secret fields from the OS keychain.
-    /// Called by the proxy daemon after `load`; not called when editing config.
-    pub(crate) fn resolve_secrets(&mut self) {
-        use crate::proxy::keychain;
+    /// Fill in any `None` secret fields from the decrypted secrets store.
+    /// Called by the proxy daemon after `load`.
+    pub(crate) fn resolve_secrets(&mut self, store: &crate::proxy::secrets::SecretsStore) {
         for (host, host_cfg) in &mut self.hosts {
             match &mut host_cfg.auth {
                 Some(AuthConfig::Bearer { token }) => {
                     if token.is_none() {
-                        *token = keychain::get(host, "token");
+                        *token = store.get(host, "token").map(str::to_owned);
                     }
                 }
                 Some(AuthConfig::Header { value, .. }) => {
                     if value.is_none() {
-                        *value = keychain::get(host, "value");
+                        *value = store.get(host, "value").map(str::to_owned);
                     }
                 }
                 Some(AuthConfig::Query { value, .. }) => {
                     if value.is_none() {
-                        *value = keychain::get(host, "value");
+                        *value = store.get(host, "value").map(str::to_owned);
                     }
                 }
                 Some(AuthConfig::OAuth2 { client_id, client_secret, .. }) => {
                     if client_id.is_none() {
-                        *client_id = keychain::get(host, "client_id");
+                        *client_id = store.get(host, "client_id").map(str::to_owned);
                     }
                     if client_secret.is_none() {
-                        *client_secret = keychain::get(host, "client_secret");
+                        *client_secret = store.get(host, "client_secret").map(str::to_owned);
                     }
                 }
                 None => {}
@@ -338,6 +341,11 @@ pub(crate) fn config_path(project_dir: &Path) -> PathBuf {
 /// Path to the runtime directory (gitignored, holds pid/port/activate).
 pub(crate) fn runtime_dir(project_dir: &Path) -> PathBuf {
     project_dir.join(".nv")
+}
+
+/// Path to the encrypted secrets file.
+pub(crate) fn secrets_path(project_dir: &Path) -> PathBuf {
+    runtime_dir(project_dir).join("secrets.enc")
 }
 
 pub(crate) fn ca_cert_path(env_dir: &Path) -> PathBuf {
