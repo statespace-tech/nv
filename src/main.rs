@@ -3,7 +3,7 @@ mod commands;
 mod error;
 mod proxy;
 
-use args::{Cli, Commands, InitArgs, KeyCommands, NameArgs};
+use args::{Cli, Commands, InitArgs, NameArgs};
 use clap::Parser;
 use error::Result;
 
@@ -38,9 +38,6 @@ async fn run() -> Result<()> {
         Commands::Port(a) => commands::env::run_port(a).await,
         Commands::Name(NameArgs { ref project_dir }) => commands::env::run_name(project_dir),
         Commands::Activate(ref a) => commands::env::run_activate(a).await,
-        Commands::Key(k) => match k.command {
-            KeyCommands::Export(ref a) => commands::env::run_key_export(&a.path),
-            KeyCommands::Import(ref a) => commands::env::run_key_import(&a.path, &a.key),
-        },
+        Commands::Sync(ref a) => commands::env::run_sync(a),
     }
 }

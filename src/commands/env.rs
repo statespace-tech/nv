@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use crate::args::{
     ActivateArgs, AddArgs, DaemonArgs, ListArgs, PortArgs, RemoveArgs, RunArgs, StopArgs,
-    TrustArgs, UntrustArgs,
+    SyncArgs, TrustArgs, UntrustArgs,
 };
 use crate::error::{Error, Result};
 use crate::proxy::ca::generate_ca;
@@ -12,8 +12,7 @@ use crate::proxy::config::{
     global_ca_dir, pid_path, port_path, runtime_dir, secrets_path, validate_project_dir,
 };
 use crate::proxy::secrets::{
-    SecretsStore, export_key, generate_key, generate_project_id, import_key, load_key,
-    store_key,
+    SecretsStore, generate_key, generate_project_id, load_key, store_key,
 };
 use crate::proxy::server::run_daemon;
 
@@ -697,31 +696,65 @@ pub(crate) async fn run_activate(args: &ActivateArgs) -> Result<()> {
     Ok(())
 }
 
-// ── Key management ────────────────────────────────────────────────────────────
+// ── Sync ──────────────────────────────────────────────────────────────────────
 
-pub(crate) fn run_key_export(path: &Path) -> Result<()> {
-    let project_dir = resolve_project_dir(path)?;
+pub(crate) fn run_sync(args: &SyncArgs) -> Result<()> {
+    let project_dir = resolve_project_dir(&args.path)?;
     validate_project_dir(&project_dir)?;
-    let config = EnvConfig::load(&project_dir)?;
-    let project_id = config
-        .id
-        .as_deref()
-        .ok_or_else(|| Error::cli("nv.toml is missing 'id'. Run `nv init` to reinitialise."))?;
-    let b64 = export_key(project_id)?;
-    println!("{b64}");
-    Ok(())
-}
 
-pub(crate) fn run_key_import(path: &Path, b64_key: &str) -> Result<()> {
-    let project_dir = resolve_project_dir(path)?;
-    validate_project_dir(&project_dir)?;
     let config = EnvConfig::load(&project_dir)?;
-    let project_id = config
-        .id
-        .as_deref()
-        .ok_or_else(|| Error::cli("nv.toml is missing 'id'. Run `nv init` to reinitialise."))?;
-    import_key(project_id, b64_key)?;
-    println!("Key imported for project '{project_id}'.");
+    let (key, sp) = load_project_key(&project_dir)?;
+    std::fs::create_dir_all(
+        sp.parent().ok_or_else(|| Error::cli("Invalid secrets path"))?,
+    )?;
+    let mut store = SecretsStore::load(&sp, &key)?;
+
+    // Collect (host, field, prompt_label) for every secret missing from both
+    // nv.toml (as an explicit/env-var value) and .nv/secrets.enc.
+    let mut missing: Vec<(String, String, String)> = Vec::new();
+
+    for (host, host_cfg) in &config.hosts {
+        let Some(ref auth) = host_cfg.auth else {
+            continue;
+        };
+        match auth {
+            AuthConfig::Bearer { token } => {
+                if token.is_none() && store.get(host, "token").is_none() {
+                    missing.push((host.clone(), "token".into(), format!("{host} (bearer token)")));
+                }
+            }
+            AuthConfig::Header { name, value } => {
+                if value.is_none() && store.get(host, "value").is_none() {
+                    missing.push((host.clone(), "value".into(), format!("{host} ({name} header)")));
+                }
+            }
+            AuthConfig::Query { param, value } => {
+                if value.is_none() && store.get(host, "value").is_none() {
+                    missing.push((host.clone(), "value".into(), format!("{host} ({param} query param)")));
+                }
+            }
+            AuthConfig::OAuth2 { client_id, client_secret, .. } => {
+                if client_id.is_none() && store.get(host, "client_id").is_none() {
+                    missing.push((host.clone(), "client_id".into(), format!("{host} (oauth2 client ID)")));
+                }
+                if client_secret.is_none() && store.get(host, "client_secret").is_none() {
+                    missing.push((host.clone(), "client_secret".into(), format!("{host} (oauth2 client secret)")));
+                }
+            }
+        }
+    }
+
+    if missing.is_empty() {
+        println!("All secrets up to date.");
+        return Ok(());
+    }
+
+    for (host, field, label) in missing {
+        let secret = prompt_secret(&label)?;
+        store.set(&host, &field, secret);
+    }
+    store.save(&sp, &key)?;
+    println!("Secrets saved.");
     Ok(())
 }
 

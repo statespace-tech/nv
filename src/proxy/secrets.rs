@@ -157,21 +157,6 @@ pub(crate) fn load_key(project_id: &str) -> Result<[u8; 32]> {
     bytes_to_key(&bytes, &path.display().to_string())
 }
 
-/// Export the project key as a base64 string (for CI or machine transfer).
-pub(crate) fn export_key(project_id: &str) -> Result<String> {
-    let key = load_key(project_id)?;
-    Ok(B64.encode(key))
-}
-
-/// Import a base64-encoded key and store it for the given project.
-pub(crate) fn import_key(project_id: &str, b64_key: &str) -> Result<()> {
-    let bytes = B64
-        .decode(b64_key.trim())
-        .map_err(|e| Error::cli(format!("Invalid key (expected base64): {e}")))?;
-    let key = bytes_to_key(&bytes, "provided key")?;
-    store_key(project_id, &key)
-}
-
 fn bytes_to_key(bytes: &[u8], source: &str) -> Result<[u8; 32]> {
     if bytes.len() != 32 {
         return Err(Error::cli(format!(

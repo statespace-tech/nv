@@ -50,8 +50,8 @@ pub(crate) enum Commands {
     #[command(name = "_name", hide = true)]
     Name(NameArgs),
 
-    /// Manage the project encryption key
-    Key(KeyArgs),
+    /// Populate missing secrets from nv.toml interactively
+    Sync(SyncArgs),
 
     /// Start a shell with the net environment active
     Activate(ActivateArgs),
@@ -188,17 +188,10 @@ pub(crate) struct NameArgs {
 }
 
 #[derive(Debug, Parser)]
-pub(crate) struct KeyArgs {
-    #[command(subcommand)]
-    pub command: KeyCommands,
-}
-
-#[derive(Debug, Subcommand)]
-pub(crate) enum KeyCommands {
-    /// Print the base64-encoded project key (for CI or transferring to another machine)
-    Export(KeyExportArgs),
-    /// Import a base64-encoded project key onto this machine
-    Import(KeyImportArgs),
+pub(crate) struct SyncArgs {
+    /// Project directory containing nv.toml (default: current directory)
+    #[arg(long, default_value = ".")]
+    pub path: PathBuf,
 }
 
 #[derive(Debug, Parser)]
@@ -208,18 +201,3 @@ pub(crate) struct ActivateArgs {
     pub path: PathBuf,
 }
 
-#[derive(Debug, Parser)]
-pub(crate) struct KeyExportArgs {
-    /// Project directory containing nv.toml (default: current directory)
-    #[arg(long, default_value = ".")]
-    pub path: PathBuf,
-}
-
-#[derive(Debug, Parser)]
-pub(crate) struct KeyImportArgs {
-    /// Base64-encoded 32-byte key (output of `nv key export`)
-    pub key: String,
-    /// Project directory containing nv.toml (default: current directory)
-    #[arg(long, default_value = ".")]
-    pub path: PathBuf,
-}
