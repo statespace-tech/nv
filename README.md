@@ -8,7 +8,7 @@ nv sits between an agent and the internet, injecting credentials automatically s
 - **Per-project secrets** — credentials are encrypted per-project; two projects using the same API can have different keys
 - **Secrets never on disk in plaintext** — AES-256-GCM encrypted at rest, decrypted into daemon memory only
 - **Agent-proof** — the encryption key lives outside the project directory; agents cannot access it
-- **CI-ready** — export the project key once; inject as `NV_KEY` in any CI provider
+- **CI-ready** — inject the project key as `NV_KEY` in any CI provider
 
 ---
 
@@ -30,15 +30,16 @@ $ nv trust
 
 ```console
 $ nv init
-Initialised net environment [myproject] in: /path/to/myproject
+Initialised net environment [.nv] in: /path/to/myproject
 
-$ nv add api.openai.com --bearer
+$ source .nv/bin/activate
+nv [.nv] active (port 51234). Run 'deactivate' to stop.
+
+[.nv] $ nv add api.example.com --bearer
 Bearer token: ••••••••
+Auth configured for 'api.example.com' (secret stored in .nv/secrets.enc).
 
-$ nv activate
-nv [myproject] active (port 51234). Type 'exit' to deactivate.
-
-$ python agent.py   # credentials injected automatically
+[.nv] $ claude "Make some API requests"
 ```
 
 ---
@@ -61,26 +62,6 @@ memory only                      ← secrets never written to disk in plaintext
 
 ---
 
-## Activating an environment
-
-**Option 1 — subshell** (no shell setup required):
-
-```console
-$ nv activate
-nv [myproject] active. Type 'exit' to deactivate.
-```
-
-**Option 2 — current shell** (sets env vars in place):
-
-```console
-$ source .nv/bin/activate
-[myproject] $
-
-[myproject] $ deactivate
-```
-
----
-
 ## Commands
 
 ### `nv init [path] [--name <name>]`
@@ -95,7 +76,9 @@ $ nv init --name myapp
 
 ### `nv add <host> <auth-type>`
 
-Configure authentication for a host. Prompts for the secret, encrypts it, and writes it to `.nv/secrets.enc`. The auth type is recorded in `nv.toml`; the secret value never is.
+Configure authentication for a host. Prompts for the secret, encrypts it into `.nv/secrets.enc`, and records the auth type in `nv.toml`. The secret value is never written to `nv.toml`.
+
+Host can be an exact hostname or a glob pattern:
 
 ```console
 $ nv add api.openai.com --bearer
@@ -103,13 +86,49 @@ $ nv add api.anthropic.com --header x-api-key
 $ nv add api.example.com --query api_key
 $ nv add auth.example.com --oauth2 --token-url https://auth.example.com/token
 $ nv add github.com --device-flow --client-id <id>
+$ nv add "*.example.com" --bearer
 ```
 
 Add `--browser` to collect the secret via a local browser form instead of a terminal prompt.
 
-### `nv activate [--path <dir>]`
+### `nv sync`
 
-Start a new shell with the proxy environment active. `exit` to leave.
+Populate missing secrets interactively. Reads `nv.toml`, finds every host with auth configured but no secret in `.nv/secrets.enc`, and prompts for each one. Run this after cloning a repo that already has an `nv.toml`.
+
+```console
+$ nv sync
+api.openai.com (bearer token): ••••••••
+api.anthropic.com (x-api-key header): ••••••••
+Secrets saved.
+```
+
+If everything is already populated:
+
+```console
+$ nv sync
+All secrets up to date.
+```
+
+### `source .nv/bin/activate`
+
+Activate the environment in the current shell. Sets `HTTP_PROXY`/`HTTPS_PROXY` to point at the nv daemon and updates the prompt. Run `deactivate` to stop.
+
+```console
+$ source .nv/bin/activate
+nv [.nv] active (port 51234). Run 'deactivate' to stop.
+
+[.nv] $ deactivate
+nv deactivated.
+```
+
+### `nv activate`
+
+Same as `source .nv/bin/activate` but spawns a subshell instead of modifying the current shell. `exit` to leave.
+
+```console
+$ nv activate
+nv [.nv] active (port 51234). Type 'exit' to deactivate.
+```
 
 ### `nv run <command>`
 
@@ -122,40 +141,28 @@ $ nv run curl https://api.openai.com/v1/models
 
 ### `nv list`
 
-Show configured hosts and auth types.
+Show all configured hosts and their auth types.
 
 ### `nv remove <host>`
 
-Remove a host's auth config and erase its secrets from `.nv/secrets.enc`.
-
-### `nv key export`
-
-Print the base64-encoded project key. Use this to move the key to another machine or inject it into CI.
-
-```console
-$ nv key export
-abc123...
-
-$ NV_KEY=$(nv key export)
-$ export NV_KEY
-$ nv activate   # daemon reads NV_KEY; activate script unsets it before agent starts
-```
-
-### `nv key import <key>`
-
-Import a base64-encoded key onto this machine.
-
-```console
-$ nv key import abc123...
-```
+Remove a host's auth config from `nv.toml` and erase its secret from `.nv/secrets.enc`.
 
 ### `nv trust` / `nv untrust`
 
-Install or remove the proxy CA from the system trust store.
+Install or remove the proxy CA from the system trust store. Required once per machine.
 
 ---
 
 ## CI usage
+
+Commit `nv.toml` and `.nv/secrets.enc` to your repository. Export the project key once and store it as a masked CI secret:
+
+```console
+$ cat ~/.config/nv/keys/<project-id> | base64
+abc123...
+```
+
+Then in CI:
 
 ```yaml
 - name: Run agent
@@ -167,8 +174,6 @@ Install or remove the proxy CA from the system trust store.
 ```
 
 `NV_KEY` is read by the daemon at startup and unset by the activate script before your command runs. The agent process never has access to it.
-
-To get the key for CI, run `nv key export` once on your dev machine and store the output as a masked secret.
 
 ---
 

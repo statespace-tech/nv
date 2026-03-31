@@ -52,12 +52,7 @@ pub(crate) fn run_create(path: &Path, name: Option<&str>) -> Result<()> {
 
     write_activate_script(&project_dir)?;
 
-    let display_name = name.unwrap_or_else(|| {
-        project_dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("nv")
-    });
+    let display_name = name.unwrap_or(".nv");
     println!(
         "Initialised net environment [{}] in: {}",
         display_name,
@@ -661,12 +656,7 @@ fn resolve_env_name(project_dir: &Path) -> String {
     EnvConfig::load(project_dir)
         .ok()
         .and_then(|c| c.name)
-        .or_else(|| {
-            project_dir
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-        })
-        .unwrap_or_else(|| "nv".to_string())
+        .unwrap_or_else(|| ".nv".to_string())
 }
 
 // ── Activate ──────────────────────────────────────────────────────────────────
