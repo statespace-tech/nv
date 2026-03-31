@@ -46,6 +46,10 @@ pub(crate) enum Commands {
     #[command(name = "_port", hide = true)]
     Port(PortArgs),
 
+    /// Print the environment display name (internal)
+    #[command(name = "_name", hide = true)]
+    Name(NameArgs),
+
     /// Manage the project encryption key
     Key(KeyArgs),
 
@@ -173,6 +177,12 @@ pub(crate) struct StopArgs {
 
 #[derive(Debug, Parser)]
 pub(crate) struct PortArgs {
+    /// Absolute path to project directory
+    pub project_dir: PathBuf,
+}
+
+#[derive(Debug, Parser)]
+pub(crate) struct NameArgs {
     /// Absolute path to project directory
     pub project_dir: PathBuf,
 }

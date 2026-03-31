@@ -75,16 +75,6 @@ fn write_activate_script(project_dir: &Path) -> Result<()> {
         .map_err(|e| Error::cli(format!("Cannot resolve project dir: {e}")))?;
     let project_dir_str = project_dir_abs.display();
 
-    let env_name = EnvConfig::load(&project_dir_abs)
-        .ok()
-        .and_then(|c| c.name)
-        .or_else(|| {
-            project_dir_abs
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-        })
-        .unwrap_or_else(|| "nv".to_string());
-
     let script = format!(
         r#"#!/bin/sh
 # nv — source this file to activate: source .nv/bin/activate
@@ -96,12 +86,14 @@ if [ $? -ne 0 ]; then
 fi
 # NV_KEY is consumed by the daemon; unset it so agent processes cannot read it
 unset NV_KEY
+# Read the env name from nv.toml at activation time (name field, else directory basename)
+_NV_NAME=$(nv _name "$_NV_DIR")
 export NV_ENV="$_NV_DIR"
 export HTTP_PROXY="http://127.0.0.1:$_NV_PORT"
 export HTTPS_PROXY="http://127.0.0.1:$_NV_PORT"
 export NO_PROXY="localhost,127.0.0.1"
 export _NV_OLD_PS1="$PS1"
-export PS1="[{env_name}] $PS1"
+export PS1="[$_NV_NAME] $PS1"
 deactivate() {{
     nv _stop "$NV_ENV"
     export PS1="$_NV_OLD_PS1"
@@ -109,7 +101,7 @@ deactivate() {{
     unset -f deactivate
     echo "nv deactivated."
 }}
-echo "nv [{env_name}] active (port $_NV_PORT). Run 'deactivate' to stop."
+echo "nv [$_NV_NAME] active (port $_NV_PORT). Run 'deactivate' to stop."
 "#
     );
 
@@ -656,6 +648,28 @@ pub(crate) async fn run_port(args: PortArgs) -> Result<()> {
     Ok(())
 }
 
+// ── Name ─────────────────────────────────────────────────────────────────────
+
+/// Resolve the display name for a project directory: `name` from nv.toml, else
+/// the directory basename. Used by the activate script at activation time.
+pub(crate) fn run_name(project_dir: &Path) -> Result<()> {
+    let name = resolve_env_name(project_dir);
+    println!("{name}");
+    Ok(())
+}
+
+fn resolve_env_name(project_dir: &Path) -> String {
+    EnvConfig::load(project_dir)
+        .ok()
+        .and_then(|c| c.name)
+        .or_else(|| {
+            project_dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "nv".to_string())
+}
+
 // ── Activate ──────────────────────────────────────────────────────────────────
 
 pub(crate) async fn run_activate(args: &ActivateArgs) -> Result<()> {
@@ -665,15 +679,7 @@ pub(crate) async fn run_activate(args: &ActivateArgs) -> Result<()> {
     let port = ensure_daemon_running(&project_dir).await?;
     let proxy_url = format!("http://127.0.0.1:{port}");
 
-    let config = EnvConfig::load(&project_dir)?;
-    let env_name = config
-        .name
-        .or_else(|| {
-            project_dir
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-        })
-        .unwrap_or_else(|| "nv".to_string());
+    let env_name = resolve_env_name(&project_dir);
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
 
