@@ -1,129 +1,17 @@
-//! Browser-based authentication helpers.
+//! Browser-based secret collection for `nv add --browser`.
 //!
-//! Two modes:
-//! - `open_login_window`: wry MITM webview for `nv add --login`
-//! - `collect_via_browser`: local HTTP form for `nv add --browser`
+//! Opens a local HTTP form so the user can paste a secret in their browser
+//! instead of the terminal prompt.
 
 use std::sync::Arc;
-use tokio::sync::Notify;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use reqwest_cookie_store::CookieStoreMutex;
-use tao::{
-    event_loop::{ControlFlow, EventLoop},
-    window::WindowBuilder,
-};
-use tracing::{info, warn};
-use wry::{ProxyConfig, ProxyEndpoint, WebViewBuilder};
+use tokio::sync::Notify;
 
 use crate::error::{Error, Result};
-
-// ── Login window (wry MITM) ───────────────────────────────────────────────────
-
-/// Spawns `nv _login <url> <proxy_port>` as a detached child process.
-pub(crate) fn open_login_window(
-    url: &str,
-    proxy_port: u16,
-) -> Result<std::process::Child> {
-    let exe = std::env::current_exe()
-        .map_err(|e| Error::cli(format!("Cannot determine executable path: {e}")))?;
-    info!("Opening login window for {url} via proxy port {proxy_port}");
-    std::process::Command::new(exe)
-        .args(["_login", url, &proxy_port.to_string()])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| Error::cli(format!("Failed to spawn login window: {e}")))
-}
-
-/// Runs the wry login window. Called as `nv _login <url> <proxy_port>`.
-/// Never returns normally — calls `std::process::exit`.
-pub(crate) fn run_login_window(url: &str, proxy_port: u16) -> ! {
-    match try_run_login_window(url, proxy_port) {
-        Ok(_) => std::process::exit(0),
-        Err(e) => {
-            eprintln!("error: {e}");
-            std::process::exit(1);
-        }
-    }
-}
-
-fn try_run_login_window(
-    url: &str,
-    proxy_port: u16,
-) -> Result<std::convert::Infallible> {
-    eprintln!("nv: opening login window — sign in, then close this window.");
-
-    let event_loop = EventLoop::new();
-
-    let window = WindowBuilder::new()
-        .with_title("Sign in — nv")
-        .with_inner_size(tao::dpi::LogicalSize::new(960.0_f64, 720.0_f64))
-        .build(&event_loop)
-        .map_err(|e| Error::cli(format!("Failed to create window: {e}")))?;
-
-    let proxy_config = ProxyConfig::Http(ProxyEndpoint {
-        host: "127.0.0.1".to_string(),
-        port: proxy_port.to_string(),
-    });
-
-    let _webview = WebViewBuilder::new(&window)
-        .with_url(url)
-        .map_err(|e| Error::cli(format!("Invalid URL: {e}")))?
-        .with_proxy_config(proxy_config)
-        .build()
-        .map_err(|e| Error::cli(format!("Failed to create webview: {e}")))?;
-
-    event_loop.run(move |event, _, control_flow| {
-        *control_flow = ControlFlow::Wait;
-        if let tao::event::Event::WindowEvent {
-            event: tao::event::WindowEvent::CloseRequested,
-            ..
-        } = event
-        {
-            *control_flow = ControlFlow::Exit;
-        }
-    })
-}
-
-// ── Cookie helpers ────────────────────────────────────────────────────────────
-
-#[allow(dead_code)]
-/// Returns `true` if the cookie store has at least one cookie for `host`.
-pub(crate) fn has_cookies_for_host(host: &str, store: &Arc<CookieStoreMutex>) -> bool {
-    let Ok(url) = reqwest::Url::parse(&format!("https://{host}/")) else {
-        return false;
-    };
-    use reqwest::cookie::CookieStore as _;
-    store.cookies(&url).is_some()
-}
-
-/// Serialize the cookie store to JSON for keychain storage.
-#[allow(deprecated)]
-pub(crate) fn serialize_cookies(store: &CookieStoreMutex) -> Option<String> {
-    let guard = store.lock().unwrap_or_else(|e| e.into_inner());
-    let mut buf = Vec::new();
-    guard.save_json(&mut buf).ok()?;
-    String::from_utf8(buf).ok()
-}
-
-/// Restore a cookie store in-place from JSON.
-#[allow(deprecated)]
-pub(crate) fn restore_cookies(json: &str, store: &CookieStoreMutex) {
-    if let Ok(loaded) = reqwest_cookie_store::CookieStore::load_json(json.as_bytes()) {
-        let mut guard = store.lock().unwrap_or_else(|e| e.into_inner());
-        *guard = loaded;
-        info!("Session cookies restored from keychain");
-    } else {
-        warn!("Failed to restore session cookies from keychain");
-    }
-}
-
-// ── Browser form (--browser flag) ────────────────────────────────────────────
 
 /// Collect a secret value via a browser form.
 pub(crate) async fn collect_via_browser(host: &str, label: &str) -> Result<String> {
