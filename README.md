@@ -31,11 +31,11 @@ Initialised net environment [myproject] in: /path/to/myproject
 $ nv activate
 nv [myproject] active (port 51234). Run 'deactivate' to stop.
 
-[myproject] $ nv add api.example.com --bearer
+$ nv add api.example.com --bearer
 Bearer token: ••••••••
 Auth configured for 'api.example.com' (secret stored in .nenv/secrets.enc).
 
-[myproject] $ claude "Make some API requests"
+$ claude "Make some API requests"
 ```
 
 ---
