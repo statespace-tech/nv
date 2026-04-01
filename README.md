@@ -94,7 +94,7 @@ All secrets up to date.
 Activate the environment in the current shell. Starts the proxy daemon, sets `HTTP_PROXY`/`HTTPS_PROXY`, and defines `deactivate` to undo everything.
 
 ```console
-$ eval "$(nv activate)"
+$ nv activate
 nv [myproject] active (port 51234). Run 'deactivate' to stop.
 
 [myproject] $ deactivate
