@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/badge/license-MIT-007ec6?style=flat-square)](https://github.com/statespace-tech/nv/blob/main/LICENSE)
 
-`nv` is a transparent HTTPS proxy for AI that sits between an agent and the internet. It injects credentials automatically so agents can make authenticated API requests without ever seeing a secret.
+`nv` is a transparent HTTPS proxy for AI that sits between your agents and the internet. It injects credentials automatically so agents can make authenticated API requests without ever seeing a secret.
 
 ---
 
