@@ -149,7 +149,7 @@ fn load_config_with_secrets(
 
 /// Run the proxy daemon. This function does not return until the process exits.
 pub(crate) async fn run_daemon(project_dir: std::path::PathBuf) -> Result<()> {
-    // Ensure runtime dir exists (.nv/)
+    // Ensure runtime dir exists (.nenv/)
     let rt_dir = runtime_dir(&project_dir);
     std::fs::create_dir_all(&rt_dir)?;
 
@@ -204,7 +204,7 @@ pub(crate) async fn run_daemon(project_dir: std::path::PathBuf) -> Result<()> {
     watcher
         .watch(&nv_toml, RecursiveMode::NonRecursive)
         .map_err(|e| Error::cli(format!("Failed to watch nv.toml: {e}")))?;
-    // Also watch .nv/ so secrets.enc changes are picked up immediately
+    // Also watch .nenv/ so secrets.enc changes are picked up immediately
     let rt_dir = runtime_dir(&project_dir);
     let _ = watcher.watch(&rt_dir, RecursiveMode::NonRecursive);
 
@@ -226,7 +226,7 @@ pub(crate) async fn run_daemon(project_dir: std::path::PathBuf) -> Result<()> {
         }
     });
 
-    // Write PID and port files into .nv/
+    // Write PID and port files into .nenv/
     let pid = std::process::id();
     std::fs::write(pid_path(&project_dir), pid.to_string())?;
     std::fs::write(port_path(&project_dir), port.to_string())?;

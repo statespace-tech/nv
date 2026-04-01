@@ -39,5 +39,7 @@ async fn run() -> Result<()> {
         Commands::Name(NameArgs { ref project_dir }) => commands::env::run_name(project_dir),
         Commands::Activate(ref a) => commands::env::run_activate(a).await,
         Commands::Sync(ref a) => commands::env::run_sync(a),
+        Commands::Allow(ref a) => commands::env::run_allow(a),
+        Commands::Block(ref a) => commands::env::run_block(a),
     }
 }

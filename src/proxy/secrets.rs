@@ -1,6 +1,6 @@
 //! Per-project encrypted secrets store.
 //!
-//! Secrets are stored in `.nv/secrets.enc` encrypted with AES-256-GCM.
+//! Secrets are stored in `.nenv/secrets.enc` encrypted with AES-256-GCM.
 //! The project key lives in `~/.config/nv/keys/<project-id>` (mode 0600),
 //! or is supplied via the `NV_KEY` environment variable (base64-encoded).
 //!
@@ -22,7 +22,7 @@ use crate::error::{Error, Result};
 
 // ── Store ────────────────────────────────────────────────────────────────────
 
-/// In-memory decrypted secrets, loaded from `.nv/secrets.enc`.
+/// In-memory decrypted secrets, loaded from `.nenv/secrets.enc`.
 #[derive(Debug, Default)]
 pub(crate) struct SecretsStore {
     map: HashMap<String, String>,
@@ -61,7 +61,7 @@ impl SecretsStore {
         let nonce = Nonce::from_slice(&data[..12]);
         let plaintext = cipher
             .decrypt(nonce, &data[12..])
-            .map_err(|_| Error::cli("Failed to decrypt .nv/secrets.enc — wrong key or corrupted file"))?;
+            .map_err(|_| Error::cli("Failed to decrypt .nenv/secrets.enc — wrong key or corrupted file"))?;
         let map: HashMap<String, String> = serde_json::from_slice(&plaintext)
             .map_err(|e| Error::cli(format!("Failed to parse secrets store: {e}")))?;
         Ok(Self { map })

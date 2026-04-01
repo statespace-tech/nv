@@ -16,7 +16,7 @@ pub(crate) enum Commands {
     /// Initialise a net environment in the current directory
     Init(InitArgs),
 
-    /// Add or update auth for a host (secret stored in .nv/secrets.enc)
+    /// Add or update auth for a host (secret stored in .nenv/secrets.enc)
     Add(AddArgs),
 
     /// Remove a host rule
@@ -53,6 +53,12 @@ pub(crate) enum Commands {
     /// Populate missing secrets from nv.toml interactively
     Sync(SyncArgs),
 
+    /// Allow a host to pass through the proxy without auth injection (strict mode only)
+    Allow(AllowArgs),
+
+    /// Block a host from passing through the proxy
+    Block(BlockArgs),
+
     /// Start a shell with the net environment active
     Activate(ActivateArgs),
 }
@@ -63,9 +69,10 @@ pub(crate) struct InitArgs {
     #[arg(default_value = ".")]
     pub path: PathBuf,
 
-    /// Display name shown in the shell prompt (default: directory name)
+    /// The name of the project (default: name of the directory)
     #[arg(long)]
     pub name: Option<String>,
+
 }
 
 #[derive(Debug, Parser)]
@@ -185,6 +192,26 @@ pub(crate) struct PortArgs {
 pub(crate) struct NameArgs {
     /// Absolute path to project directory
     pub project_dir: PathBuf,
+}
+
+#[derive(Debug, Parser)]
+pub(crate) struct AllowArgs {
+    /// Hostname or glob pattern to allow (e.g. api.example.com or *.example.com)
+    pub host: String,
+
+    /// Project directory containing nv.toml (default: current directory)
+    #[arg(long, default_value = ".")]
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Parser)]
+pub(crate) struct BlockArgs {
+    /// Hostname or glob pattern to block (e.g. api.example.com or *.example.com)
+    pub host: String,
+
+    /// Project directory containing nv.toml (default: current directory)
+    #[arg(long, default_value = ".")]
+    pub path: PathBuf,
 }
 
 #[derive(Debug, Parser)]

@@ -64,7 +64,12 @@ pub(crate) struct EnvConfig {
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub(crate) struct ProxyConfig {
     pub timeout_secs: Option<u64>,
+    /// Hosts explicitly allowed (checked before block list; wins over wildcards).
+    #[serde(default)]
     pub allow_only: Option<Vec<String>>,
+    /// Hosts explicitly blocked. Use `"*"` to block all traffic by default.
+    #[serde(default)]
+    pub block: Option<Vec<String>>,
 }
 
 /// Per-host rule.
@@ -213,13 +218,31 @@ impl EnvConfig {
         }
     }
 
-    /// Returns `true` if `host` is allowed by the `allow_only` list (or if no list is set).
+    /// Returns `true` if `host` is permitted through the proxy.
+    /// Returns `true` if `host` is permitted through the proxy.
+    ///
+    /// Evaluation order:
+    /// 1. `allow_only` — explicit allow wins over everything, including `block = ["*"]`.
+    /// 2. `block` — explicit deny (supports `"*"` to block all by default).
+    /// 3. Default — permit.
     pub(crate) fn is_host_allowed(&self, host: &str) -> bool {
-        let Some(ref allowed) = self.proxy.allow_only else {
-            return true;
-        };
         let bare = strip_port(host);
-        allowed.iter().any(|pattern| pattern.as_str() == bare || host_glob_matches(pattern, bare))
+
+        // Explicit allow wins over everything
+        if let Some(ref allowed) = self.proxy.allow_only {
+            if allowed.iter().any(|p| pattern_matches_any(p, bare)) {
+                return true;
+            }
+        }
+
+        // Explicit block
+        if let Some(ref blocked) = self.proxy.block {
+            if blocked.iter().any(|p| pattern_matches_any(p, bare)) {
+                return false;
+            }
+        }
+
+        true
     }
 
     /// Find the first `HostConfig` that matches `host` and `path`.
@@ -251,6 +274,14 @@ impl EnvConfig {
 
         None
     }
+}
+
+/// Match a host against a pattern. `"*"` matches any host.
+fn pattern_matches_any(pattern: &str, host: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    pattern == host || host_glob_matches(pattern, host)
 }
 
 fn host_glob_matches(pattern: &str, host: &str) -> bool {
@@ -340,7 +371,7 @@ pub(crate) fn config_path(project_dir: &Path) -> PathBuf {
 
 /// Path to the runtime directory (gitignored, holds pid/port/activate).
 pub(crate) fn runtime_dir(project_dir: &Path) -> PathBuf {
-    project_dir.join(".nv")
+    project_dir.join(".nenv")
 }
 
 /// Path to the encrypted secrets file.
@@ -391,8 +422,8 @@ pub(crate) fn global_ca_cert_path() -> Option<PathBuf> {
 }
 
 /// Default config template written on env creation.
-pub(crate) fn default_config_template() -> &'static str {
-    r#"# nv.toml — net environment configuration
+pub(crate) fn default_config_template() -> String {
+    format!(r#"# nv.toml — net environment configuration
 #
 # Host patterns:
 #   exact host:       "api.example.com"
@@ -402,40 +433,39 @@ pub(crate) fn default_config_template() -> &'static str {
 #
 # Match order: host+path (most specific) before host-only; exact before glob; file order wins ties.
 #
-# Secret fields can be omitted to use the OS keychain (set via `nv add`),
-# or set explicitly using $VAR / ${VAR} environment variable expansion.
+# Secret fields can be set explicitly using $VAR / ${{VAR}} environment variable expansion,
+# or omitted to be populated via `nv add` / `nv sync`.
 
 [proxy]
 # timeout_secs = 30
-# allow_only = ["api.openai.com", "api.anthropic.com"]
 
 # ── Bearer token ──────────────────────────────────────────────────────────────
-# Keychain:  nv add api.openai.com --bearer
-# Env var:   token = "$OPENAI_API_KEY"
-# [hosts."api.openai.com".auth]
+# Run:     nv add api.stripe.com --bearer
+# Env var: token = "$STRIPE_API_KEY"
+# [hosts."api.stripe.com".auth]
 # type = "bearer"
 
-# ── Custom header auth (e.g. Anthropic) ───────────────────────────────────────
-# Keychain:  nv add api.anthropic.com --header x-api-key
-# Env var:   value = "$ANTHROPIC_API_KEY"
-# [hosts."api.anthropic.com".auth]
+# ── Custom header auth ────────────────────────────────────────────────────────
+# Run:     nv add api.notion.com --header authorization
+# Env var: value = "$NOTION_API_KEY"
+# [hosts."api.notion.com".auth]
 # type = "header"
-# name = "x-api-key"
+# name = "authorization"
 
 # ── Extra headers ─────────────────────────────────────────────────────────────
-# [hosts."api.anthropic.com".headers]
-# anthropic-version = "2023-06-01"
+# [hosts."api.notion.com".headers]
+# Notion-Version = "2022-06-28"
 
 # ── Query-parameter auth ──────────────────────────────────────────────────────
-# Keychain:  nv add api.example.com --query api_key
-# Env var:   value = "$EXAMPLE_API_KEY"
-# [hosts."api.example.com".auth]
+# Run:     nv add maps.googleapis.com --query key
+# Env var: value = "$GOOGLE_API_KEY"
+# [hosts."maps.googleapis.com".auth]
 # type = "query"
-# param = "api_key"
+# param = "key"
 
 # ── OAuth2 client credentials ─────────────────────────────────────────────────
-# Keychain:  nv add api.internal.com --oauth2 --token-url https://auth.internal.com/token
-# Env vars:  client_id = "$CLIENT_ID" / client_secret = "$CLIENT_SECRET"
+# Run:     nv add api.internal.com --oauth2 --token-url https://auth.internal.com/token
+# Env var: client_id = "$CLIENT_ID" / client_secret = "$CLIENT_SECRET"
 # [hosts."api.internal.com".auth]
 # type = "oauth2"
 # token_url = "https://auth.internal.com/token"
@@ -450,4 +480,5 @@ pub(crate) fn default_config_template() -> &'static str {
 # [hosts."api.staging.com"]
 # redirect = "localhost:8080"
 "#
+    )
 }

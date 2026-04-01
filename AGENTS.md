@@ -14,7 +14,7 @@ Your HTTP client does not need special configuration — any client that respect
 
 ## What you should NOT do
 
-- Do not read, write, or inspect `.nv/secrets.enc`. It is encrypted and its contents are not meaningful to you.
+- Do not read, write, or inspect `.nenv/secrets.enc`. It is encrypted and its contents are not meaningful to you.
 - Do not attempt to read `NV_KEY`. It is unset before you start.
 - Do not manage credentials yourself. If a request returns 401, it means auth is not configured for that host — see below.
 

@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::args::{
-    ActivateArgs, AddArgs, DaemonArgs, ListArgs, PortArgs, RemoveArgs, RunArgs, StopArgs,
-    SyncArgs, TrustArgs, UntrustArgs,
+    ActivateArgs, AddArgs, AllowArgs, BlockArgs, DaemonArgs, ListArgs, PortArgs, RemoveArgs,
+    RunArgs, StopArgs, SyncArgs, TrustArgs, UntrustArgs,
 };
 use crate::error::{Error, Result};
 use crate::proxy::ca::generate_ca;
@@ -52,13 +52,18 @@ pub(crate) fn run_create(path: &Path, name: Option<&str>) -> Result<()> {
 
     write_activate_script(&project_dir)?;
 
-    let display_name = name.unwrap_or(".nv");
+    let display_name = name.unwrap_or_else(|| {
+        project_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("nv")
+    });
     println!(
         "Initialised net environment [{}] in: {}",
         display_name,
         project_dir.display()
     );
-    println!("Activate with: source .nv/bin/activate");
+    println!("Activate with: source .nenv/bin/activate");
 
     Ok(())
 }
@@ -71,7 +76,7 @@ fn write_activate_script(project_dir: &Path) -> Result<()> {
 
     let script = format!(
         r#"#!/bin/sh
-# nv — source this file to activate: source .nv/bin/activate
+# nv — source this file to activate: source .nenv/bin/activate
 _NV_DIR="{project_dir_str}"
 _NV_PORT=$(nv _port "$_NV_DIR")
 if [ $? -ne 0 ]; then
@@ -133,10 +138,15 @@ pub(crate) async fn run_add(args: AddArgs) -> Result<()> {
         .entry(args.host.clone())
         .or_insert_with(HostConfig::default)
         .auth = Some(auth);
+    // nv add implicitly allows the host
+    let allowed = config.proxy.allow_only.get_or_insert_with(Vec::new);
+    if !allowed.contains(&args.host) {
+        allowed.push(args.host.clone());
+    }
     config.save(&project_dir)?;
 
     println!(
-        "Auth configured for '{}' (secret stored in .nv/secrets.enc).",
+        "Auth configured for '{}' (secret stored in .nenv/secrets.enc).",
         args.host
     );
     Ok(())
@@ -446,6 +456,13 @@ pub(crate) fn run_remove(args: &RemoveArgs) -> Result<()> {
                 let _ = store.save(&sp, &key);
             }
         }
+        // Clean up allow_only and block lists
+        if let Some(ref mut allowed) = config.proxy.allow_only {
+            allowed.retain(|h| h != &args.host);
+        }
+        if let Some(ref mut blocked) = config.proxy.block {
+            blocked.retain(|h| h != &args.host);
+        }
         config.save(&project_dir)?;
         println!("Removed '{}'.", args.host);
     } else {
@@ -656,7 +673,46 @@ fn resolve_env_name(project_dir: &Path) -> String {
     EnvConfig::load(project_dir)
         .ok()
         .and_then(|c| c.name)
-        .unwrap_or_else(|| ".nv".to_string())
+        .or_else(|| {
+            project_dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "nv".to_string())
+}
+
+// ── Allow / Block ─────────────────────────────────────────────────────────────
+
+pub(crate) fn run_allow(args: &AllowArgs) -> Result<()> {
+    let project_dir = resolve_project_dir(&args.path)?;
+    validate_project_dir(&project_dir)?;
+
+    let mut config = EnvConfig::load(&project_dir)?;
+    let allowed = config.proxy.allow_only.get_or_insert_with(Vec::new);
+    if allowed.contains(&args.host) {
+        println!("'{}' is already allowed.", args.host);
+        return Ok(());
+    }
+    allowed.push(args.host.clone());
+    config.save(&project_dir)?;
+    println!("Allowed '{}' (pass-through, no auth injection).", args.host);
+    Ok(())
+}
+
+pub(crate) fn run_block(args: &BlockArgs) -> Result<()> {
+    let project_dir = resolve_project_dir(&args.path)?;
+    validate_project_dir(&project_dir)?;
+
+    let mut config = EnvConfig::load(&project_dir)?;
+    let blocked = config.proxy.block.get_or_insert_with(Vec::new);
+    if blocked.contains(&args.host) {
+        println!("'{}' is already blocked.", args.host);
+        return Ok(());
+    }
+    blocked.push(args.host.clone());
+    config.save(&project_dir)?;
+    println!("Blocked '{}'.", args.host);
+    Ok(())
 }
 
 // ── Activate ──────────────────────────────────────────────────────────────────
@@ -667,22 +723,28 @@ pub(crate) async fn run_activate(args: &ActivateArgs) -> Result<()> {
 
     let port = ensure_daemon_running(&project_dir).await?;
     let proxy_url = format!("http://127.0.0.1:{port}");
-
     let env_name = resolve_env_name(&project_dir);
+    let project_dir_str = project_dir.display();
 
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    // Print to stderr so it isn't captured by eval
+    eprintln!("nv [{env_name}] active (port {port}). Run 'deactivate' to stop.");
 
-    eprintln!("nv [{env_name}] active (port {port}). Type 'exit' to deactivate.");
+    // Print shell commands to stdout for: eval "$(nv activate)"
+    println!("export HTTP_PROXY='{proxy_url}';");
+    println!("export HTTPS_PROXY='{proxy_url}';");
+    println!("export NO_PROXY='localhost,127.0.0.1';");
+    println!("export NV_ENV='{project_dir_str}';");
+    println!("unset NV_KEY;");
+    println!("export _NV_OLD_PS1=\"$PS1\";");
+    println!("export PS1='[{env_name}] '$PS1;");
+    println!(
+        "deactivate() {{ nv _stop \"$NV_ENV\"; \
+        export PS1=\"$_NV_OLD_PS1\"; \
+        unset HTTP_PROXY HTTPS_PROXY NV_ENV NO_PROXY _NV_OLD_PS1; \
+        unset -f deactivate; \
+        echo 'nv deactivated.'; }}"
+    );
 
-    std::process::Command::new(&shell)
-        .env("HTTP_PROXY", &proxy_url)
-        .env("HTTPS_PROXY", &proxy_url)
-        .env("NO_PROXY", "localhost,127.0.0.1")
-        .env("NV_ENV", project_dir.as_os_str())
-        .status()
-        .map_err(|e| Error::cli(format!("Failed to start shell '{shell}': {e}")))?;
-
-    eprintln!("nv [{env_name}] deactivated.");
     Ok(())
 }
 
@@ -700,7 +762,7 @@ pub(crate) fn run_sync(args: &SyncArgs) -> Result<()> {
     let mut store = SecretsStore::load(&sp, &key)?;
 
     // Collect (host, field, prompt_label) for every secret missing from both
-    // nv.toml (as an explicit/env-var value) and .nv/secrets.enc.
+    // nv.toml (as an explicit/env-var value) and .nenv/secrets.enc.
     let mut missing: Vec<(String, String, String)> = Vec::new();
 
     for (host, host_cfg) in &config.hosts {

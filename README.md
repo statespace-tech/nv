@@ -1,18 +1,14 @@
 # nv
 
-### A transparent HTTPS proxy for AI agents.
+[![License](https://img.shields.io/badge/license-MIT-007ec6?style=flat-square)](https://github.com/statespace-tech/nv/blob/main/LICENSE)
 
-nv sits between an agent and the internet, injecting credentials automatically so agents can make authenticated API requests without ever seeing a secret.
-
-- **Zero agent changes** — any HTTP client that respects `HTTP_PROXY`/`HTTPS_PROXY` works out of the box
-- **Per-project secrets** — credentials are encrypted per-project; two projects using the same API can have different keys
-- **Secrets never on disk in plaintext** — AES-256-GCM encrypted at rest, decrypted into daemon memory only
-- **Agent-proof** — the encryption key lives outside the project directory; agents cannot access it
-- **CI-ready** — inject the project key as `NV_KEY` in any CI provider
+`nv` is a transparent HTTPS proxy for AI that sits between an agent and the internet. It injects credentials automatically so agents can make authenticated API requests without ever seeing a secret.
 
 ---
 
 ## Installation
+
+Install nv:
 
 ```console
 $ cargo install --path .
@@ -30,34 +26,16 @@ $ nv trust
 
 ```console
 $ nv init
-Initialised net environment [.nv] in: /path/to/myproject
+Initialised net environment [myproject] in: /path/to/myproject
 
-$ source .nv/bin/activate
-nv [.nv] active (port 51234). Run 'deactivate' to stop.
+$ nv activate
+nv [myproject] active (port 51234). Run 'deactivate' to stop.
 
-[.nv] $ nv add api.example.com --bearer
+[myproject] $ nv add api.example.com --bearer
 Bearer token: ••••••••
-Auth configured for 'api.example.com' (secret stored in .nv/secrets.enc).
+Auth configured for 'api.example.com' (secret stored in .nenv/secrets.enc).
 
-[.nv] $ claude "Make some API requests"
-```
-
----
-
-## How it works
-
-```
-agent → HTTP_PROXY → nv daemon → inject credentials → upstream API
-```
-
-nv performs MITM proxying for HTTPS using a locally-trusted CA. Secrets are stored encrypted in `.nv/secrets.enc`, decrypted by the daemon at startup using a per-project key stored outside the project directory.
-
-```
-~/.config/nv/keys/<project-id>   ← AES-256 key  (never in project dir)
-        ↓ decrypts
-.nv/secrets.enc                  ← encrypted secrets  (gitignored)
-        ↓ daemon loads into
-memory only                      ← secrets never written to disk in plaintext
+[myproject] $ claude "Make some API requests"
 ```
 
 ---
@@ -76,24 +54,26 @@ $ nv init --name myapp
 
 ### `nv add <host> <auth-type>`
 
-Configure authentication for a host. Prompts for the secret, encrypts it into `.nv/secrets.enc`, and records the auth type in `nv.toml`. The secret value is never written to `nv.toml`.
+Configure authentication for a host. Prompts for the secret, encrypts it into `.nenv/secrets.enc`, and records the auth type in `nv.toml`. The secret value is never written to `nv.toml`.
 
 Host can be an exact hostname or a glob pattern:
 
 ```console
-$ nv add api.openai.com --bearer
-$ nv add api.anthropic.com --header x-api-key
-$ nv add api.example.com --query api_key
+$ nv add api.stripe.com --bearer
+$ nv add api.notion.com --header authorization
+$ nv add maps.googleapis.com --query key
+$ nv add api.sendgrid.com --bearer
 $ nv add auth.example.com --oauth2 --token-url https://auth.example.com/token
 $ nv add github.com --device-flow --client-id <id>
-$ nv add "*.example.com" --bearer
+$ nv add "*.googleapis.com" --query key
+$ nv add "*.azure.com" --bearer
 ```
 
-Add `--browser` to collect the secret via a local browser form instead of a terminal prompt.
+> Tip: Add `--browser` to collect the secret via a local browser form instead of a terminal prompt.
 
 ### `nv sync`
 
-Populate missing secrets interactively. Reads `nv.toml`, finds every host with auth configured but no secret in `.nv/secrets.enc`, and prompts for each one. Run this after cloning a repo that already has an `nv.toml`.
+Populate missing secrets interactively. Reads `nv.toml`, finds every host with auth configured but no secret in `.nenv/secrets.enc`, and prompts for each one. Run this after cloning a repo that already has an `nv.toml`.
 
 ```console
 $ nv sync
@@ -109,26 +89,19 @@ $ nv sync
 All secrets up to date.
 ```
 
-### `source .nv/bin/activate`
+### `nv activate`
 
-Activate the environment in the current shell. Sets `HTTP_PROXY`/`HTTPS_PROXY` to point at the nv daemon and updates the prompt. Run `deactivate` to stop.
+Activate the environment in the current shell. Starts the proxy daemon, sets `HTTP_PROXY`/`HTTPS_PROXY`, and defines `deactivate` to undo everything.
 
 ```console
-$ source .nv/bin/activate
-nv [.nv] active (port 51234). Run 'deactivate' to stop.
+$ eval "$(nv activate)"
+nv [myproject] active (port 51234). Run 'deactivate' to stop.
 
-[.nv] $ deactivate
+[myproject] $ deactivate
 nv deactivated.
 ```
 
-### `nv activate`
-
-Same as `source .nv/bin/activate` but spawns a subshell instead of modifying the current shell. `exit` to leave.
-
-```console
-$ nv activate
-nv [.nv] active (port 51234). Type 'exit' to deactivate.
-```
+> `source .nenv/bin/activate` is equivalent.
 
 ### `nv run <command>`
 
@@ -143,9 +116,31 @@ $ nv run curl https://api.openai.com/v1/models
 
 Show all configured hosts and their auth types.
 
+### `nv allow <host>`
+
+Allow a host to pass through the proxy without auth injection. Useful for hosts the agent needs to reach but that don't require credentials. Accepts globs.
+
+```console
+$ nv allow cdn.example.com
+$ nv allow "*.cloudflare.com"
+```
+
+### `nv block <host>`
+
+Block a host from passing through the proxy. Use `"*"` to block all traffic by default, then selectively allow or add hosts.
+
+```console
+$ nv block "*.analytics.com"
+$ nv block "*"                    # block everything by default
+$ nv add api.stripe.com --bearer  # implicitly allowed, wins over block *
+$ nv allow cdn.example.com        # pass-through, also wins over block *
+```
+
+Explicit allows (`nv add`, `nv allow`) always take precedence over blocks, including `"*"`.
+
 ### `nv remove <host>`
 
-Remove a host's auth config from `nv.toml` and erase its secret from `.nv/secrets.enc`.
+Remove a host's auth config from `nv.toml` and erase its secret from `.nenv/secrets.enc`.
 
 ### `nv trust` / `nv untrust`
 
@@ -155,7 +150,7 @@ Install or remove the proxy CA from the system trust store. Required once per ma
 
 ## CI usage
 
-Commit `nv.toml` and `.nv/secrets.enc` to your repository. Export the project key once and store it as a masked CI secret:
+Commit `nv.toml` and `.nenv/secrets.enc` to your repository. Export the project key once and store it as a masked CI secret:
 
 ```console
 $ cat ~/.config/nv/keys/<project-id> | base64
@@ -169,7 +164,7 @@ Then in CI:
   env:
     NV_KEY: ${{ secrets.NV_PROJECT_KEY }}
   run: |
-    source .nv/bin/activate
+    source .nenv/bin/activate
     python agent.py
 ```
 
@@ -179,25 +174,24 @@ Then in CI:
 
 ## nv.toml
 
-`nv.toml` is committed to your repository. It contains auth types and host rules — never secrets.
+`nv.toml` can be committed to your repository. It contains auth types and host rules but **never** secrets.
 
 ```toml
-id = "a3f9c2d1-..."   # stable project ID, do not edit
+id = "a3f9c2d1-..."
 
 [proxy]
-# timeout_secs = 30
-# allow_only = ["api.openai.com", "api.anthropic.com"]
+block = ["*"]
+allow_only = ["api.stripe.com", "cdn.example.com"]
 
-[hosts."api.openai.com".auth]
+[hosts."api.stripe.com".auth]
 type = "bearer"
-# token = "$OPENAI_API_KEY"   ← env var fallback; or use: nv add api.openai.com --bearer
 
-[hosts."api.anthropic.com".auth]
+[hosts."api.notion.com".auth]
 type = "header"
-name = "x-api-key"
+name = "authorization"
 
-[hosts."api.anthropic.com".headers]
-anthropic-version = "2023-06-01"
+[hosts."api.notion.com".headers]
+Notion-Version = "2022-06-28"
 
 [hosts."auth.example.com".auth]
 type = "oauth2"
@@ -216,19 +210,12 @@ scopes = ["read", "write"]
 
 ---
 
-## Project layout
+## Community
 
-```
-your-project/
-├── nv.toml          # committed — project ID, host rules, no secrets
-└── .nv/             # gitignored — runtime state + encrypted secrets
-    ├── secrets.enc
-    ├── proxy.pid
-    ├── proxy.port
-    └── bin/activate
+- **Discord** — [Join our community server](https://discord.gg/statespace) for real-time help and discussions
+- **X** — Follow us [@statespace_tech](https://x.com/statespace_tech) for updates and news
+- **Issues** — Report bugs or request features on [GitHub Issues](https://github.com/statespace-tech/nv/issues)
 
-~/.config/nv/
-├── proxy-ca/        # global CA (shared across projects)
-└── keys/
-    └── <project-id> # 32-byte AES key, mode 0600
-```
+## License
+
+This project is licensed under the terms of the MIT license.
